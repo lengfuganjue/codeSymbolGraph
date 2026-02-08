@@ -1,0 +1,21 @@
+node_modules/
+dist/
+*.db
+*.db-journal
+.cache/
+.claude/
+e2e-stderr.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Env
+.env
+.env.*
