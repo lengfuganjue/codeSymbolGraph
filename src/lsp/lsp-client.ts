@@ -133,6 +133,8 @@ export class LspClient extends EventEmitter {
     }
 
     async stop(): Promise<void> {
+        // 先设状态，防止 Windows Ctrl+C 信号提前杀掉子进程后触发自动重启
+        this.setState('stopped');
         this.stopHealthCheck();
 
         if (this.connection) {
@@ -158,8 +160,6 @@ export class LspClient extends EventEmitter {
                 }
             }, 5000);
         }
-
-        this.setState('stopped');
     }
 
     // ===== LSP 请求封装 =====
