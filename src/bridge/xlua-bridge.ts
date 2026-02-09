@@ -5,7 +5,7 @@ import { LspTimeoutError } from '../utils/timeout.js';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { glob } from 'glob';
-import type { DocumentSymbol, SymbolInformation } from 'vscode-languageserver-protocol';
+import type { SymbolInformation } from 'vscode-languageserver-protocol';
 
 const CS_CALL_PATTERN = /CS\.([\w.]+)[:\.](\w+)\s*\(/g;
 const CS_ALIAS_PATTERN = /local\s+(\w+)\s*=\s*CS\.([\w.]+)\s*$/gm;
@@ -269,6 +269,10 @@ export class XLuaBridge {
 
     // ===== 批量验证 =====
 
+    /**
+     * Verify XLua calls by querying workspace/symbol for each unique member name,
+     * then matching the symbol's containerName against the expected className.
+     */
     private async batchVerifyWithCSharp(
         calls: XLuaCall[],
     ): Promise<Map<string, VerifiedSymbol>> {
@@ -277,30 +281,57 @@ export class XLuaBridge {
         const csharpClient = this.lspManager.getClientForLanguage('csharp');
         if (csharpClient.state !== 'ready') return result;
 
-        const uniqueClasses = new Set(calls.map(c => c.className));
-        const classSymbols = new Map<string, SymbolInformation[]>();
+        // Deduplicate by className.memberName
+        const uniquePairs = new Map<string, XLuaCall>();
+        for (const call of calls) {
+            const key = `${call.className}.${call.memberName}`;
+            if (!uniquePairs.has(key)) uniquePairs.set(key, call);
+        }
 
-        for (const className of uniqueClasses) {
-            const shortName = className.split('.').pop()!;
-            try {
-                const symbols = await csharpClient.workspaceSymbol(shortName);
-                classSymbols.set(className, symbols);
-            } catch (e) {
-                if (e instanceof LspTimeoutError) continue;
-                classSymbols.set(className, []);
+        // Query workspaceSymbol for each unique member name (deduplicated)
+        const queriedMembers = new Map<string, SymbolInformation[]>();
+        for (const [, call] of uniquePairs) {
+            if (!queriedMembers.has(call.memberName)) {
+                try {
+                    const symbols = await csharpClient.workspaceSymbol(call.memberName);
+                    queriedMembers.set(call.memberName, symbols);
+                } catch (e) {
+                    if (e instanceof LspTimeoutError) continue;
+                    queriedMembers.set(call.memberName, []);
+                }
             }
         }
 
-        for (const call of calls) {
-            const key = `${call.className}.${call.memberName}`;
-            if (result.has(key)) continue;
+        for (const [key, call] of uniquePairs) {
+            const symbols = queriedMembers.get(call.memberName) || [];
+            const shortClassName = call.className.split('.').pop()!;
 
-            const symbols = classSymbols.get(call.className) || [];
             const matched = symbols.find(s => {
-                const symFqn = s.containerName
-                    ? `${s.containerName}.${s.name}`
-                    : s.name;
-                return (symFqn === key || symFqn.endsWith(key)) && s.name === call.memberName;
+                // csharp-ls returns name in format: "ReturnType Container.Member(params)"
+                // containerName is often null, so we parse the name field.
+                const container = s.containerName ?? '';
+                let memberName = s.name;
+
+                if (!container) {
+                    // Parse "ReturnType Container.Member(params)" or "Type Container.field"
+                    const parsed = this.parseCsharpLsSymbolName(s.name);
+                    if (parsed) {
+                        memberName = parsed.member;
+                        // Check member name AND container
+                        if (memberName !== call.memberName) return false;
+                        return parsed.container === shortClassName ||
+                            parsed.container.endsWith(shortClassName) ||
+                            call.className.endsWith(parsed.container);
+                    }
+                    return false;
+                }
+
+                // Standard LSP: containerName is set
+                if (memberName !== call.memberName) return false;
+                if (container === call.className) return true;
+                if (container.endsWith(shortClassName)) return true;
+                if (call.className.endsWith(container) && container.length > 0) return true;
+                return false;
             });
 
             if (matched) {
@@ -312,7 +343,32 @@ export class XLuaBridge {
             }
         }
 
+        if (result.size > 0 || uniquePairs.size > 0) {
+            console.error(`[CSG] xlua verify: ${uniquePairs.size} unique pairs, ${queriedMembers.size} member queries, ${result.size} verified`);
+        }
+
         return result;
+    }
+
+    /**
+     * Parse csharp-ls workspace/symbol name format: "ReturnType Container.Member(params)"
+     * Examples:
+     *   "bool SafeAreaDebugOverlay.IsShowing()" → { container: "SafeAreaDebugOverlay", member: "IsShowing" }
+     *   "void GpuHudFacade.SetGpuHudAsset(List<GpuHudAsset> assets)" → { container: "GpuHudFacade", member: "SetGpuHudAsset" }
+     *   "GPUInstancingManager GPUInstancingManager.GetInstance()" → { container: "GPUInstancingManager", member: "GetInstance" }
+     */
+    private parseCsharpLsSymbolName(name: string): { container: string; member: string } | null {
+        // Match: "anything Container.Member" or "anything Container.Member(..."
+        const match = name.match(/\s([\w.]+)\.([\w]+)\s*(?:\(|$)/);
+        if (match) {
+            return { container: match[1], member: match[2] };
+        }
+        // Simple format without return type: "Container.Member(..." or "Container.Member"
+        const simpleMatch = name.match(/^([\w.]+)\.([\w]+)\s*(?:\(|$)/);
+        if (simpleMatch) {
+            return { container: simpleMatch[1], member: simpleMatch[2] };
+        }
+        return null;
     }
 
     // ===== 内部方法 =====
@@ -381,7 +437,7 @@ export class XLuaBridge {
                 const symbols = await luaLs.documentSymbol(uri);
                 for (const call of fileCalls) {
                     call.callerFqn = this.findEnclosingSymbol(
-                        symbols as (SymbolInformation | DocumentSymbol)[], call.line,
+                        symbols as import('vscode-languageserver-protocol').DocumentSymbol[], call.line,
                     );
                 }
             } catch { /* don't block */ }
@@ -389,19 +445,18 @@ export class XLuaBridge {
     }
 
     private findEnclosingSymbol(
-        symbols: (SymbolInformation | DocumentSymbol)[],
+        symbols: import('vscode-languageserver-protocol').DocumentSymbol[],
         line: number,
     ): string | undefined {
         for (const sym of symbols) {
-            const docSym = sym as DocumentSymbol;
-            if (docSym.range &&
-                docSym.range.start.line <= line - 1 &&
-                docSym.range.end.line >= line - 1) {
-                if (docSym.children) {
-                    const inner = this.findEnclosingSymbol(docSym.children, line);
+            if (sym.range &&
+                sym.range.start.line <= line - 1 &&
+                sym.range.end.line >= line - 1) {
+                if (sym.children) {
+                    const inner = this.findEnclosingSymbol(sym.children, line);
                     if (inner) return inner;
                 }
-                return docSym.name;
+                return sym.name;
             }
         }
         return undefined;

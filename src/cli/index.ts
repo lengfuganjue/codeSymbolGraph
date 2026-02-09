@@ -33,6 +33,32 @@ async function loadConfig(): Promise<{ config: CsgConfig; adv: AdvancedConfig }>
     }
 }
 
+/**
+ * Poll workspace/symbol until the C# LSP returns results, indicating indexing is complete.
+ * Falls back to a fixed wait if Lua-only (no C# sln configured).
+ */
+async function waitForLspIndexing(lspManager: LspManager, maxWaitMs: number): Promise<void> {
+    const POLL_INTERVAL = 3000;
+    const startTime = Date.now();
+    const csharpClient = lspManager.getClientForLanguage('csharp');
+
+    while (Date.now() - startTime < maxWaitMs) {
+        try {
+            const results = await csharpClient.workspaceSymbol('Object');
+            if (results.length > 0) {
+                const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+                console.log(`C# LSP indexing ready (${results.length} symbols found, ${elapsed}s)`);
+                return;
+            }
+        } catch {
+            // LSP not ready yet, keep polling
+        }
+        await new Promise(r => setTimeout(r, POLL_INTERVAL));
+    }
+
+    console.warn(`Warning: C# LSP indexing did not complete within ${maxWaitMs / 1000}s, proceeding anyway...`);
+}
+
 const program = new Command();
 
 program
@@ -382,9 +408,9 @@ program
         console.log(`C# LSP: ${status.csharp.state}`);
         console.log(`Lua LSP: ${status.lua.state}`);
 
-        // Wait for LSP to finish indexing
+        // Wait for LSP servers to finish indexing by polling workspace/symbol
         console.log('Waiting for LSP indexing...');
-        await new Promise(r => setTimeout(r, 5000));
+        await waitForLspIndexing(lspManager, adv.lspInitTimeoutMs);
 
         // XLua scan
         if (config.luaRoot) {
