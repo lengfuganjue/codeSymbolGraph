@@ -9,12 +9,34 @@ import { LspTimeoutError } from '../utils/timeout.js';
 import { z } from 'zod';
 import type { CallChainNode } from '../core/query-service.js';
 
-/** 统一错误处理包装 */
+const INDEXING_WAIT_TIMEOUT = 90_000;
+
+/** 统一错误处理包装，自动等待 C# 索引完成 */
 async function wrapTool<T>(
     lspManager: LspManager,
+    indexingReady: Promise<void>,
     fn: () => Promise<McpToolResponse<T>>,
 ): Promise<{ content: { type: 'text'; text: string }[] }> {
     const lspStatus = lspManager.getLspStatusForMcp();
+
+    // 等待索引完成（带超时保护）
+    try {
+        await Promise.race([
+            indexingReady,
+            new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error('C# indexing timeout')), INDEXING_WAIT_TIMEOUT),
+            ),
+        ]);
+    } catch {
+        const resp = errorResponse(
+            'LSP_NOT_READY',
+            'C# indexing still in progress, please retry later',
+            lspStatus,
+        );
+        return {
+            content: [{ type: 'text' as const, text: JSON.stringify(resp) }],
+        };
+    }
 
     try {
         const result = await fn();
@@ -48,6 +70,7 @@ export function registerTools(
     lspManager: LspManager,
     cache: CacheManager,
     workspaceRoot: string,
+    indexingReady: Promise<void>,
 ): void {
 
     // ===== csg_find_definition =====
@@ -60,7 +83,7 @@ export function registerTools(
             line: z.number().optional().describe('行号 1-based（按位置查模式）'),
             column: z.number().optional().describe('列号 0-based（按位置查模式）'),
         },
-        async (args) => wrapTool(lspManager, async () => {
+        async (args) => wrapTool(lspManager, indexingReady, async () => {
             const results = await queryService.findDefinition({
                 name: args.name,
                 file: args.file,
@@ -102,7 +125,7 @@ export function registerTools(
             line: z.number().optional().describe('行号 1-based'),
             column: z.number().optional().describe('列号 0-based'),
         },
-        async (args) => wrapTool(lspManager, async () => {
+        async (args) => wrapTool(lspManager, indexingReady, async () => {
             const result = await queryService.findReferences({
                 name: args.name,
                 file: args.file,
@@ -154,7 +177,7 @@ export function registerTools(
             direction: z.enum(['incoming', 'outgoing', 'both']).default('both'),
             max_depth: z.number().optional().default(3).describe('最大递归深度'),
         },
-        async (args) => wrapTool(lspManager, async () => {
+        async (args) => wrapTool(lspManager, indexingReady, async () => {
             const result = await queryService.findCallChain({
                 name: args.name,
                 file: args.file,
@@ -190,7 +213,7 @@ export function registerTools(
         {
             name: z.string().describe('C# FQN 或 Lua 全局名（如 "CS.Game.ItemManager"）'),
         },
-        async (args) => wrapTool(lspManager, async () => {
+        async (args) => wrapTool(lspManager, indexingReady, async () => {
             const result = await xluaBridge.queryCrossLang(args.name);
 
             const lspStatus = lspManager.getLspStatusForMcp();
@@ -226,7 +249,7 @@ export function registerTools(
             line: z.number().optional().describe('行号 1-based'),
             column: z.number().optional().describe('列号 0-based'),
         },
-        async (args) => wrapTool(lspManager, async () => {
+        async (args) => wrapTool(lspManager, indexingReady, async () => {
             const refs = await queryService.findReferences({
                 name: args.name,
                 file: args.file,

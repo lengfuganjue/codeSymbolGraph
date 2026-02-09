@@ -36,26 +36,55 @@ export async function startMcpServer(options: CsgServerOptions): Promise<void> {
         console.error(`[CSG] [${e.level}] ${e.message}`);
     });
 
+    // 后台索引等待 Promise：工具调用前 await 此 Promise 确保 C# 索引就绪
+    let resolveIndexing: () => void;
+    const indexingReady = new Promise<void>(r => { resolveIndexing = r; });
+
     // 注册 MCP 工具
-    registerTools(server, queryService, xluaBridge, lspManager, cache, options.workspaceRoot);
+    registerTools(server, queryService, xluaBridge, lspManager, cache, options.workspaceRoot, indexingReady);
+
+    // 清理函数：立即可用，fileWatcher 启动后补充
+    let fileWatcher: FileWatcher | null = null;
+    let cleaningUp = false;
+    const cleanup = async () => {
+        if (cleaningUp) return;
+        cleaningUp = true;
+        console.error('[CSG] Shutting down...');
+        if (fileWatcher) await fileWatcher.stop();
+        await lspManager.stopAll();
+        cache.close();
+        process.exit(0);
+    };
+    process.on('SIGINT', cleanup);
+    process.on('SIGTERM', cleanup);
 
     // 先连接 MCP transport，让 Claude Code 不会卡住
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error('[CSG] MCP server running on stdio');
 
+    // MCP transport 断开时（如 Claude Code 退出）触发清理
+    // SDK 的 StdioServerTransport 不监听 stdin 'end'，需要自己处理
+    process.stdin.on('end', () => cleanup());
+
     // 后台启动 LSP（不阻塞 MCP 连接）
     console.error('[CSG] Starting LSP servers in background...');
-    lspManager.startAll().then(() => {
+    lspManager.startAll().then(async () => {
         const status = lspManager.getStatus();
         console.error(`[CSG] C# LSP: ${status.csharp.state} (${status.csharp.name})`);
         console.error(`[CSG] Lua LSP: ${status.lua.state} (${status.lua.name})`);
+
+        // 等待 C# 索引完成
+        console.error('[CSG] Waiting for C# indexing...');
+        await lspManager.waitForCsharpIndexing();
+        resolveIndexing!();
+        console.error('[CSG] C# indexing ready, tools unblocked');
 
         // LSP 就绪后启动文件监控
         const updateCoordinator = new UpdateCoordinator(
             lspManager, cache, xluaBridge, options.workspaceRoot,
         );
-        const fileWatcher = new FileWatcher(options.workspaceRoot, {
+        fileWatcher = new FileWatcher(options.workspaceRoot, {
             debounceMs: options.fileWatcherDebounceMs,
         });
 
@@ -75,19 +104,8 @@ export async function startMcpServer(options: CsgServerOptions): Promise<void> {
                 console.error(`[CSG] XLua scan failed: ${err}`);
             });
         }
-
-        // 注册清理（需要在这里捕获 fileWatcher 引用）
-        const cleanup = async () => {
-            console.error('[CSG] Shutting down...');
-            await fileWatcher.stop();
-            await lspManager.stopAll();
-            cache.close();
-            process.exit(0);
-        };
-        process.on('SIGINT', cleanup);
-        process.on('SIGTERM', cleanup);
     }).catch((err) => {
         console.error(`[CSG] LSP start failed: ${err}`);
-        // MCP 仍然运行，工具调用会返回 LSP_NOT_READY 错误
+        resolveIndexing!(); // 解除工具阻塞，让它们返回 LSP_NOT_READY
     });
 }

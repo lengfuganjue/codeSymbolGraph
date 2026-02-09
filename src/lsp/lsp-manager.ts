@@ -26,6 +26,7 @@ export interface LspManagerStatus {
     csharp: { state: LspState; name: string };
     lua: { state: LspState; name: string };
     allReady: boolean;
+    indexing: { csharp: boolean };
 }
 
 export class LspManager extends EventEmitter {
@@ -34,6 +35,12 @@ export class LspManager extends EventEmitter {
 
     readonly csharpTracker = new OpenFileTracker();
     readonly luaTracker = new OpenFileTracker();
+
+    /** C# 索引是否已完成 */
+    isCsharpIndexed = false;
+
+    /** 等待 C# 索引完成的 Promise（由外部调用 waitForCsharpIndexing() 后赋值） */
+    csharpIndexingReady: Promise<void> = Promise.resolve();
 
     constructor(private options: LspManagerOptions) {
         super();
@@ -113,6 +120,7 @@ export class LspManager extends EventEmitter {
                 name: 'LuaLS',
             },
             allReady: this.csharpClient.state === 'ready' && this.luaClient.state === 'ready',
+            indexing: { csharp: this.isCsharpIndexed },
         };
     }
 
@@ -127,6 +135,38 @@ export class LspManager extends EventEmitter {
             csharp: this.csharpClient.state,
             lua: this.luaClient.state,
         };
+    }
+
+    /**
+     * 轮询 workspace/symbol 直到 C# LSP 索引完成。
+     * 返回 Promise，resolve 时索引已就绪。
+     */
+    async waitForCsharpIndexing(maxWaitMs = 60000): Promise<void> {
+        const POLL_INTERVAL = 3000;
+        const startTime = Date.now();
+
+        while (Date.now() - startTime < maxWaitMs) {
+            try {
+                const results = await this.csharpClient.workspaceSymbol('Object');
+                if (results.length > 0) {
+                    this.isCsharpIndexed = true;
+                    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+                    this.emit('log', {
+                        level: 'info',
+                        message: `C# indexing ready (${results.length} symbols, ${elapsed}s)`,
+                    });
+                    return;
+                }
+            } catch {
+                // LSP not ready yet, keep polling
+            }
+            await new Promise(r => setTimeout(r, POLL_INTERVAL));
+        }
+
+        this.emit('log', {
+            level: 'warn',
+            message: `C# indexing did not complete within ${maxWaitMs / 1000}s`,
+        });
     }
 
     private getCSharpOptions(): LspClientOptions {
