@@ -1,7 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { LspManager, type LspManagerOptions } from '../lsp/lsp-manager.js';
-import { CacheManager } from '../cache/cache-manager.js';
+import { CacheManager, type CacheManagerOptions } from '../cache/cache-manager.js';
 import { QueryService } from '../core/query-service.js';
 import { XLuaBridge } from '../bridge/xlua-bridge.js';
 import { FileWatcher } from '../watcher/file-watcher.js';
@@ -11,6 +11,9 @@ import { registerTools } from './tools.js';
 export interface CsgServerOptions extends LspManagerOptions {
     dbPath: string;
     luaRoot?: string;
+    extraThirdPartyNamespaces?: string[];
+    cacheOptions?: CacheManagerOptions;
+    fileWatcherDebounceMs?: number;
 }
 
 export async function startMcpServer(options: CsgServerOptions): Promise<void> {
@@ -20,11 +23,12 @@ export async function startMcpServer(options: CsgServerOptions): Promise<void> {
     });
 
     const lspManager = new LspManager(options);
-    const cache = new CacheManager(options.dbPath);
+    const cache = new CacheManager(options.dbPath, options.cacheOptions);
     const queryService = new QueryService(lspManager, cache, options.workspaceRoot);
     const xluaBridge = new XLuaBridge(
         lspManager, cache, options.workspaceRoot,
         options.luaRoot || options.workspaceRoot,
+        options.extraThirdPartyNamespaces,
     );
 
     // 转发 LSP 日志
@@ -51,7 +55,9 @@ export async function startMcpServer(options: CsgServerOptions): Promise<void> {
         const updateCoordinator = new UpdateCoordinator(
             lspManager, cache, xluaBridge, options.workspaceRoot,
         );
-        const fileWatcher = new FileWatcher(options.workspaceRoot);
+        const fileWatcher = new FileWatcher(options.workspaceRoot, {
+            debounceMs: options.fileWatcherDebounceMs,
+        });
 
         fileWatcher.on('changes', async (changes: import('../watcher/file-watcher.js').FileChange[]) => {
             const result = await updateCoordinator.processChanges(changes);

@@ -39,6 +39,8 @@ export interface LspClientOptions {
     workspaceRoot: string;
     initOptions?: Record<string, unknown>;
     healthCheckInterval?: number;
+    /** 最大自动重启次数 (默认 5) */
+    maxRestarts?: number;
     /** Override client capabilities (some LSP servers crash on certain fields) */
     clientCapabilities?: object;
 }
@@ -345,7 +347,7 @@ export class LspClient extends EventEmitter {
     }
 
     private async tryRestart(): Promise<void> {
-        const maxRestarts = 5;
+        const maxRestarts = this.options.maxRestarts ?? 5;
         const backoffMs = Math.min(1000 * Math.pow(2, this.restartCount), 30000);
 
         if (this.restartCount >= maxRestarts) {

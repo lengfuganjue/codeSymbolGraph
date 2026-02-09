@@ -64,33 +64,36 @@ export interface CrossLangResult {
  */
 const UNITY_NS = ['UnityEngine', 'UnityEditor'];
 const DOTNET_NS = ['System', 'Microsoft'];
-const THIRD_PARTY_NS = [
+const BUILTIN_THIRD_PARTY_NS = [
     'Spine', 'TMPro', 'DG', 'Cinemachine', 'BehaviorDesigner',
     'BitBenderGames', 'FluffyUnderware', 'HedgehogTeam', 'Neonagee',
     'Mopsicus', 'OWL', 'UMT', 'NPinyin', 'ImageEffects', 'MobileMedia',
     'DeviceInfo', 'GpuHudFacade', 'AudioStudio',
 ];
 
-function classifyUnresolved(className: string): string {
+function classifyUnresolved(className: string, thirdPartyNs: string[]): string {
     const topNs = className.split('.')[0];
     if (UNITY_NS.includes(topNs)) return 'unity_builtin';
     if (DOTNET_NS.includes(topNs)) return 'dotnet_builtin';
-    if (THIRD_PARTY_NS.includes(topNs)) return 'third_party';
+    if (thirdPartyNs.includes(topNs)) return 'third_party';
     return 'unresolved';
 }
 
 export class XLuaBridge {
+    private luaRoot: string;
+    private thirdPartyNs: string[];
+
     constructor(
         private lspManager: LspManager,
         private cache: CacheManager,
         private workspaceRoot: string,
         luaRoot: string,
+        extraThirdPartyNamespaces?: string[],
     ) {
         // Resolve relative luaRoot against workspaceRoot
         this.luaRoot = path.isAbsolute(luaRoot) ? luaRoot : path.resolve(workspaceRoot, luaRoot);
+        this.thirdPartyNs = [...BUILTIN_THIRD_PARTY_NS, ...(extraThirdPartyNamespaces ?? [])];
     }
-
-    private luaRoot: string;
 
     async fullScan(): Promise<ScanResult> {
         const result: ScanResult = {
@@ -150,7 +153,7 @@ export class XLuaBridge {
                     );
                 } else {
                     result.unresolved++;
-                    const status = classifyUnresolved(call.className);
+                    const status = classifyUnresolved(call.className, this.thirdPartyNs);
                     insertClassified.run(
                         call.pattern, call.file, call.line, call.callerFqn ?? null, '', status,
                     );
@@ -205,7 +208,7 @@ export class XLuaBridge {
                         verified.signature ?? null, Date.now(),
                     );
                 } else {
-                    const status = classifyUnresolved(call.className);
+                    const status = classifyUnresolved(call.className, this.thirdPartyNs);
                     this.cache.db.prepare(`
                         INSERT OR REPLACE INTO xlua_mappings
                         (lua_call_pattern, lua_file, lua_line, lua_caller_fqn,

@@ -12,6 +12,14 @@ export interface LspManagerOptions {
     csharpLsp?: CSharpLspKind;
     csharpLspPath?: string;
     lualsPath?: string;
+    /** Lua 运行时版本 (默认 "Lua 5.3") */
+    luaVersion?: string;
+    /** LuaLS maxPreload (默认 10000) */
+    lualsMaxPreload?: number;
+    /** LuaLS preloadFileSize (默认 500) */
+    lualsPreloadFileSize?: number;
+    /** 健康检查间隔 ms (默认 30000) */
+    healthCheckIntervalMs?: number;
 }
 
 export interface LspManagerStatus {
@@ -135,7 +143,7 @@ export class LspManager extends EventEmitter {
                 command,
                 args,
                 workspaceRoot: this.options.workspaceRoot,
-                healthCheckInterval: 30000,
+                healthCheckInterval: this.options.healthCheckIntervalMs ?? 30000,
                 // csharp-ls 0.5.6 crashes (exit code 3) when textDocument capabilities
                 // are present in the initialize request. Only send workspace capabilities.
                 clientCapabilities: {
@@ -160,7 +168,7 @@ export class LspManager extends EventEmitter {
                 command,
                 args,
                 workspaceRoot: this.options.workspaceRoot,
-                healthCheckInterval: 30000,
+                healthCheckInterval: this.options.healthCheckIntervalMs ?? 30000,
             };
         }
     }
@@ -180,15 +188,15 @@ export class LspManager extends EventEmitter {
                     Lua: {
                         workspace: {
                             library: [],
-                            maxPreload: 10000,
-                            preloadFileSize: 500,
+                            maxPreload: this.options.lualsMaxPreload ?? 10000,
+                            preloadFileSize: this.options.lualsPreloadFileSize ?? 500,
                         },
-                        runtime: { version: 'Lua 5.3' },
+                        runtime: { version: this.options.luaVersion ?? 'Lua 5.3' },
                         diagnostics: { enable: false },
                     },
                 },
             },
-            healthCheckInterval: 30000,
+            healthCheckInterval: this.options.healthCheckIntervalMs ?? 30000,
         };
     }
 }

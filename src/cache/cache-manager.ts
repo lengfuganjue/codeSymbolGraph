@@ -2,25 +2,35 @@ import Database from 'better-sqlite3';
 import { createHash } from 'crypto';
 import { LRUCache } from 'lru-cache';
 
-/** 引用缓存 TTL（毫秒） */
-const REFERENCE_CACHE_TTL_MS = 60 * 1000;
-
-/** 调用链缓存 TTL（毫秒） */
-const CALL_CHAIN_CACHE_TTL_MS = 120 * 1000;
+export interface CacheManagerOptions {
+    /** 内存缓存最大条目数 (默认 5000) */
+    cacheMaxEntries?: number;
+    /** 内存缓存 TTL 分钟 (默认 10) */
+    cacheTtlMinutes?: number;
+    /** 引用缓存 TTL 秒 (默认 60) */
+    referenceCacheTtlSeconds?: number;
+    /** 调用链缓存 TTL 秒 (默认 120) */
+    callChainCacheTtlSeconds?: number;
+}
 
 export class CacheManager {
     private _db: Database.Database;
     private memCache: LRUCache<string, object>;
+    private referenceCacheTtlMs: number;
+    private callChainCacheTtlMs: number;
 
-    constructor(dbPath: string) {
+    constructor(dbPath: string, options?: CacheManagerOptions) {
         this._db = new Database(dbPath);
         this._db.pragma('journal_mode = WAL');
         this._db.pragma('synchronous = NORMAL');
         this._db.pragma('cache_size = -64000');
 
+        this.referenceCacheTtlMs = (options?.referenceCacheTtlSeconds ?? 60) * 1000;
+        this.callChainCacheTtlMs = (options?.callChainCacheTtlSeconds ?? 120) * 1000;
+
         this.memCache = new LRUCache({
-            max: 5000,
-            ttl: 1000 * 60 * 10, // 10 minutes
+            max: options?.cacheMaxEntries ?? 5000,
+            ttl: (options?.cacheTtlMinutes ?? 10) * 60 * 1000,
         });
 
         this.initSchema();
@@ -120,7 +130,7 @@ export class CacheManager {
         const memResult = this.memCache.get(cacheKey);
         if (memResult) return memResult as CachedReference[];
 
-        const cutoff = Date.now() - REFERENCE_CACHE_TTL_MS;
+        const cutoff = Date.now() - this.referenceCacheTtlMs;
         const results = this._db.prepare(`
             SELECT * FROM reference_cache
             WHERE target_fqn = ? AND cached_at > ?

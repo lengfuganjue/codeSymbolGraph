@@ -3,13 +3,27 @@
  * - 使用 <Project Sdk="Microsoft.NET.Sdk"> 而不是显式 Import
  * - 保持所有源文件和引用
  * - 去掉 Unity 特殊元素
+ *
+ * 用法: tsx scripts/create-sdk-csproj.ts <BallClient根目录>
+ * 示例: tsx scripts/create-sdk-csproj.ts F:\workspace\BallClient
  */
 import * as fs from 'fs';
 import * as path from 'path';
 
-const BALL_CLIENT_ROOT = 'F:\\workspace\\BallClient';
-const INPUT = path.join(BALL_CLIENT_ROOT, 'Assembly-CSharp-patched.csproj');
-const OUTPUT = path.join(BALL_CLIENT_ROOT, 'Assembly-CSharp-sdk.csproj');
+const ballClientRoot = process.argv[2];
+if (!ballClientRoot) {
+    console.error('用法: tsx scripts/create-sdk-csproj.ts <BallClient根目录>');
+    console.error('示例: tsx scripts/create-sdk-csproj.ts F:\\workspace\\BallClient');
+    process.exit(1);
+}
+
+const INPUT = path.join(ballClientRoot, 'Assembly-CSharp-patched.csproj');
+const OUTPUT = path.join(ballClientRoot, 'Assembly-CSharp-sdk.csproj');
+
+if (!fs.existsSync(INPUT)) {
+    console.error(`输入文件不存在: ${INPUT}`);
+    process.exit(1);
+}
 
 let content = fs.readFileSync(INPUT, 'utf-8');
 
@@ -77,6 +91,6 @@ Global
 \tEndGlobalSection
 EndGlobal
 `;
-const slnPath = path.join(BALL_CLIENT_ROOT, 'ballclient-sdk.sln');
+const slnPath = path.join(ballClientRoot, 'ballclient-sdk.sln');
 fs.writeFileSync(slnPath, slnContent.trim() + '\n', 'utf-8');
 console.log(`Written: ${slnPath}`);

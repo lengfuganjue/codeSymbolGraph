@@ -12,24 +12,21 @@ import { QueryService } from '../core/query-service.js';
 import { XLuaBridge } from '../bridge/xlua-bridge.js';
 import { FileWatcher } from '../watcher/file-watcher.js';
 import { UpdateCoordinator } from '../core/update-coordinator.js';
-
-interface CsgConfig {
-    slnPath: string;
-    luaRoot: string | null;
-    csharpLsp: 'csharp-ls' | 'omnisharp';
-    csharpLspPath: string | null;
-    lualsPath: string | null;
-}
+import { type CsgConfig, type AdvancedConfig, resolveAdvanced } from '../config.js';
+import { setTimeouts } from '../utils/timeout.js';
 
 const CONFIG_DIR = '.codesymbolgraph';
 const CONFIG_FILE = 'config.json';
 const DB_FILE = 'cache.db';
 
-async function loadConfig(): Promise<CsgConfig> {
+async function loadConfig(): Promise<{ config: CsgConfig; adv: AdvancedConfig }> {
     const configPath = path.join(process.cwd(), CONFIG_DIR, CONFIG_FILE);
     try {
         const raw = await fs.readFile(configPath, 'utf-8');
-        return JSON.parse(raw);
+        const config: CsgConfig = JSON.parse(raw);
+        const adv = resolveAdvanced(config.advanced);
+        setTimeouts({ lspTimeoutMs: adv.lspTimeoutMs, lspInitTimeoutMs: adv.lspInitTimeoutMs });
+        return { config, adv };
     } catch {
         console.error('Config not found. Run "csg init" first.');
         process.exit(1);
@@ -211,7 +208,7 @@ program
     .command('start')
     .description('Start background service (LSP + File Watcher + MCP Server)')
     .action(async () => {
-        const config = await loadConfig();
+        const { config, adv } = await loadConfig();
         const workspaceRoot = process.cwd();
         const dbPath = path.join(workspaceRoot, CONFIG_DIR, DB_FILE);
 
@@ -224,18 +221,30 @@ program
             csharpLsp: config.csharpLsp,
             csharpLspPath: config.csharpLspPath || undefined,
             lualsPath: config.lualsPath || undefined,
+            luaVersion: adv.luaVersion,
+            lualsMaxPreload: adv.lualsMaxPreload,
+            lualsPreloadFileSize: adv.lualsPreloadFileSize,
+            healthCheckIntervalMs: adv.healthCheckIntervalMs,
         });
 
-        const cache = new CacheManager(dbPath);
+        const cache = new CacheManager(dbPath, {
+            cacheMaxEntries: adv.cacheMaxEntries,
+            cacheTtlMinutes: adv.cacheTtlMinutes,
+            referenceCacheTtlSeconds: adv.referenceCacheTtlSeconds,
+            callChainCacheTtlSeconds: adv.callChainCacheTtlSeconds,
+        });
         const queryService = new QueryService(lspManager, cache, workspaceRoot);
         const xluaBridge = new XLuaBridge(
             lspManager, cache, workspaceRoot,
             config.luaRoot || workspaceRoot,
+            adv.extraThirdPartyNamespaces,
         );
         const updateCoordinator = new UpdateCoordinator(
             lspManager, cache, xluaBridge, workspaceRoot,
         );
-        const fileWatcher = new FileWatcher(workspaceRoot);
+        const fileWatcher = new FileWatcher(workspaceRoot, {
+            debounceMs: adv.fileWatcherDebounceMs,
+        });
 
         lspManager.on('log', (e: { level: string; message: string }) => {
             console.log(`[${e.level}] ${e.message}`);
@@ -278,7 +287,7 @@ program
     .command('mcp')
     .description('Run as MCP Server (for Claude Code integration)')
     .action(async () => {
-        const config = await loadConfig();
+        const { config, adv } = await loadConfig();
         const workspaceRoot = process.cwd();
         const dbPath = path.join(workspaceRoot, CONFIG_DIR, DB_FILE);
 
@@ -290,6 +299,18 @@ program
             csharpLsp: config.csharpLsp,
             csharpLspPath: config.csharpLspPath || undefined,
             lualsPath: config.lualsPath || undefined,
+            luaVersion: adv.luaVersion,
+            lualsMaxPreload: adv.lualsMaxPreload,
+            lualsPreloadFileSize: adv.lualsPreloadFileSize,
+            healthCheckIntervalMs: adv.healthCheckIntervalMs,
+            extraThirdPartyNamespaces: adv.extraThirdPartyNamespaces,
+            cacheOptions: {
+                cacheMaxEntries: adv.cacheMaxEntries,
+                cacheTtlMinutes: adv.cacheTtlMinutes,
+                referenceCacheTtlSeconds: adv.referenceCacheTtlSeconds,
+                callChainCacheTtlSeconds: adv.callChainCacheTtlSeconds,
+            },
+            fileWatcherDebounceMs: adv.fileWatcherDebounceMs,
         });
     });
 
@@ -324,7 +345,7 @@ program
     .command('warmup')
     .description('Warm up cache (index all files)')
     .action(async () => {
-        const config = await loadConfig();
+        const { config, adv } = await loadConfig();
         const workspaceRoot = process.cwd();
         const dbPath = path.join(workspaceRoot, CONFIG_DIR, DB_FILE);
 
@@ -337,9 +358,18 @@ program
             csharpLsp: config.csharpLsp,
             csharpLspPath: config.csharpLspPath || undefined,
             lualsPath: config.lualsPath || undefined,
+            luaVersion: adv.luaVersion,
+            lualsMaxPreload: adv.lualsMaxPreload,
+            lualsPreloadFileSize: adv.lualsPreloadFileSize,
+            healthCheckIntervalMs: adv.healthCheckIntervalMs,
         });
 
-        const cache = new CacheManager(dbPath);
+        const cache = new CacheManager(dbPath, {
+            cacheMaxEntries: adv.cacheMaxEntries,
+            cacheTtlMinutes: adv.cacheTtlMinutes,
+            referenceCacheTtlSeconds: adv.referenceCacheTtlSeconds,
+            callChainCacheTtlSeconds: adv.callChainCacheTtlSeconds,
+        });
 
         lspManager.on('log', (e: { level: string; message: string }) => {
             console.log(`[${e.level}] ${e.message}`);
@@ -362,6 +392,7 @@ program
             const xluaBridge = new XLuaBridge(
                 lspManager, cache, workspaceRoot,
                 config.luaRoot,
+                adv.extraThirdPartyNamespaces,
             );
             const scanResult = await xluaBridge.fullScan();
             console.log(`XLua scan: ${scanResult.totalCalls} calls, ${scanResult.verified} verified, ${scanResult.unresolved} unresolved (${scanResult.duration}ms)`);
