@@ -91,10 +91,11 @@ export class LspClient extends EventEmitter {
                 new StreamMessageWriter(this.process.stdin!),
             );
 
-            // Handle server-to-client requests (e.g., client/registerCapability)
-            // csharp-ls 0.5.6 blocks if these are not responded to
+            // Handle server-to-client requests that block if unhandled
             this.connection.onRequest('client/registerCapability', () => ({}));
             this.connection.onRequest('client/unregisterCapability', () => ({}));
+            // csharp-ls 0.20+ requests workspace configuration on init
+            this.connection.onRequest('workspace/configuration', () => [{}]);
 
             this.connection.listen();
 
