@@ -111,7 +111,7 @@ const tests: TestCase[] = [
 async function main() {
     console.log(`\n=== CSG MCP 端到端测试 ===`);
     console.log(`项目目录: ${BALLCLIENT_DIR}`);
-    console.log(`LSP 等待上限: ${LSP_READY_WAIT / 1000}s\n`);
+    console.log(`工具调用超时: ${TOOL_TIMEOUT / 1000}s（含服务端索引等待）\n`);
 
     // 1. 启动 MCP server
     console.log('启动 csg mcp ...');
