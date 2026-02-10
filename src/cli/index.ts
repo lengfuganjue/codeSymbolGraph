@@ -925,6 +925,9 @@ function formatQueryResult(tool: string, result: unknown): void {
                     console.log(`  L${w.line}: ${w.message}`);
                 }
             }
+            if (data?.filteredUnityNoise) {
+                console.log(`\n(${data.filteredUnityNoise} Unity assembly noise error(s) filtered)`);
+            }
             console.log(`\nTotal: ${data?.total || 0} diagnostic(s)`);
             break;
         }

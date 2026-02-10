@@ -333,38 +333,68 @@ export async function handleCheckLua(
     return successResponse(data);
 }
 
+/** 匹配 Unity 程序集缺失导致的噪音错误（CS0246/CS0234/CS0103/CS0115 等） */
+const UNITY_NOISE_PATTERNS = [
+    // CS0246: 未能找到类型或命名空间名
+    /未能找到类型或命名空间名/,
+    /The type or namespace name .+ could not be found/,
+    // CS0234: 命名空间中不存在类型
+    /中不存在类型或命名空间名/,
+    /does not exist in the namespace/,
+    // CS0103: 当前上下文中不存在名称（如 Application, GameObject, Mathf 等 Unity API）
+    /当前上下文中不存在名称/,
+    /The name .+ does not exist in the current context/,
+    // CS0115: 找不到适合的方法来重写（缺少基类）
+    /找不到适合的方法来重写/,
+    /no suitable method found to override/i,
+    // CS0246/CS1061: 缺少程序集引用导致的成员找不到
+    /是否缺少 using 指令或程序集引用/,
+    /are you missing a using directive or an assembly reference/i,
+];
+
+function isUnityNoiseError(message: string): boolean {
+    return UNITY_NOISE_PATTERNS.some(p => p.test(message));
+}
+
 export async function handleCheckCsharp(
     ctx: QueryContext,
-    args: { file: string; severity?: string },
+    args: { file: string; severity?: string; filter_noise?: boolean },
 ): Promise<McpToolResponse> {
     const result = await ctx.lspManager.checkFile(args.file);
     const severity = args.severity || 'all';
+    const filterNoise = args.filter_noise !== false; // 默认过滤
 
-    const diagnostics: { errors: unknown[]; warnings: unknown[] } = {
-        errors: result.errors.map(d => ({
-            line: d.range.start.line + 1,
-            message: d.message,
-            source: d.source,
-        })),
-        warnings: result.warnings.map(d => ({
-            line: d.range.start.line + 1,
-            message: d.message,
-            source: d.source,
-        })),
-    };
+    const mapDiag = (d: { range: { start: { line: number } }; message: string; source?: string }) => ({
+        line: d.range.start.line + 1,
+        message: d.message,
+        source: d.source,
+    });
+
+    let errors = result.errors.map(mapDiag);
+    const warnings = result.warnings.map(mapDiag);
+
+    let filteredCount = 0;
+    if (filterNoise) {
+        const before = errors.length;
+        errors = errors.filter(e => !isUnityNoiseError(e.message));
+        filteredCount = before - errors.length;
+    }
 
     const data: Record<string, unknown> = { file: result.file };
     if (severity === 'error') {
-        data.errors = diagnostics.errors;
-        data.total = diagnostics.errors.length;
+        data.errors = errors;
+        data.total = errors.length;
     } else if (severity === 'warning') {
-        data.errors = diagnostics.errors;
-        data.warnings = diagnostics.warnings;
-        data.total = diagnostics.errors.length + diagnostics.warnings.length;
+        data.errors = errors;
+        data.warnings = warnings;
+        data.total = errors.length + warnings.length;
     } else {
-        data.errors = diagnostics.errors;
-        data.warnings = diagnostics.warnings;
-        data.total = diagnostics.errors.length + diagnostics.warnings.length;
+        data.errors = errors;
+        data.warnings = warnings;
+        data.total = errors.length + warnings.length;
+    }
+    if (filteredCount > 0) {
+        data.filteredUnityNoise = filteredCount;
     }
 
     return successResponse(data);

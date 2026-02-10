@@ -281,10 +281,11 @@ export async function startMcpProxyServer(daemonPort: number): Promise<void> {
 
     server.tool(
         'csg_check_csharp',
-        '对 C# 文件执行编译检查。返回编译错误和警告列表。',
+        '对 C# 文件执行编译检查。返回编译错误和警告列表。默认过滤 Unity 程序集缺失的噪音错误。',
         {
             file: z.string().describe('C# 文件路径（相对或绝对）'),
             severity: z.enum(['error', 'warning', 'all']).optional().default('all').describe('返回的诊断级别'),
+            filter_noise: z.boolean().optional().default(true).describe('是否过滤 Unity 程序集缺失的噪音错误（默认 true）'),
         },
         async (args) => toMcpResult(await proxyCall('/api/check-csharp', args)),
     );
