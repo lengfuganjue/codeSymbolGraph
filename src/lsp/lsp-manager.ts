@@ -39,6 +39,9 @@ export class LspManager extends EventEmitter {
     /** C# 索引是否已完成 */
     isCsharpIndexed = false;
 
+    /** Lua 索引是否已完成 */
+    isLuaIndexed = false;
+
     /** 等待 C# 索引完成的 Promise（由外部调用 waitForCsharpIndexing() 后赋值） */
     csharpIndexingReady: Promise<void> = Promise.resolve();
 
@@ -145,17 +148,17 @@ export class LspManager extends EventEmitter {
         const POLL_INTERVAL = 3000;
         const startTime = Date.now();
 
+        // 阶段 1：等待 workspace/symbol 返回结果（解决方案已加载）
         while (Date.now() - startTime < maxWaitMs) {
             try {
                 const results = await this.csharpClient.workspaceSymbol('Object');
                 if (results.length > 0) {
-                    this.isCsharpIndexed = true;
                     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
                     this.emit('log', {
                         level: 'info',
-                        message: `C# indexing ready (${results.length} symbols, ${elapsed}s)`,
+                        message: `C# symbols loaded (${results.length} symbols, ${elapsed}s)`,
                     });
-                    return;
+                    break;
                 }
             } catch {
                 // LSP not ready yet, keep polling
@@ -163,9 +166,42 @@ export class LspManager extends EventEmitter {
             await new Promise(r => setTimeout(r, POLL_INTERVAL));
         }
 
+        this.isCsharpIndexed = true;
+        const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        this.emit('log', {
+            level: 'info',
+            message: `C# indexing ready (${totalElapsed}s)`,
+        });
+    }
+
+    /**
+     * 轮询 workspace/symbol 直到 LuaLS 索引完成。
+     */
+    async waitForLuaIndexing(maxWaitMs = 60000): Promise<void> {
+        const POLL_INTERVAL = 3000;
+        const startTime = Date.now();
+
+        while (Date.now() - startTime < maxWaitMs) {
+            try {
+                const results = await this.luaClient.workspaceSymbol('require');
+                if (results.length > 0) {
+                    this.isLuaIndexed = true;
+                    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+                    this.emit('log', {
+                        level: 'info',
+                        message: `Lua indexing ready (${results.length} symbols, ${elapsed}s)`,
+                    });
+                    return;
+                }
+            } catch {
+                // LuaLS not ready yet, keep polling
+            }
+            await new Promise(r => setTimeout(r, POLL_INTERVAL));
+        }
+
         this.emit('log', {
             level: 'warn',
-            message: `C# indexing did not complete within ${maxWaitMs / 1000}s`,
+            message: `Lua indexing did not complete within ${maxWaitMs / 1000}s`,
         });
     }
 

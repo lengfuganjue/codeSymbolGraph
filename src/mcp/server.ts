@@ -1,3 +1,4 @@
+import * as http from 'http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { LspManager, type LspManagerOptions } from '../lsp/lsp-manager.js';
@@ -7,6 +8,7 @@ import { XLuaBridge } from '../bridge/xlua-bridge.js';
 import { FileWatcher } from '../watcher/file-watcher.js';
 import { UpdateCoordinator } from '../core/update-coordinator.js';
 import { registerTools } from './tools.js';
+import { z } from 'zod';
 
 export interface CsgServerOptions extends LspManagerOptions {
     dbPath: string;
@@ -16,6 +18,7 @@ export interface CsgServerOptions extends LspManagerOptions {
     fileWatcherDebounceMs?: number;
 }
 
+/** 独立模式：本地启动 LSP，直接处理查询 */
 export async function startMcpServer(options: CsgServerOptions): Promise<void> {
     const server = new McpServer({
         name: 'CodeSymbolGraph',
@@ -76,9 +79,22 @@ export async function startMcpServer(options: CsgServerOptions): Promise<void> {
 
         // 等待 C# 索引完成
         console.error('[CSG] Waiting for C# indexing...');
-        await lspManager.waitForCsharpIndexing();
+        await lspManager.waitForCsharpIndexing(180_000);
+        console.error('[CSG] C# indexing ready');
+
+        // XLua 扫描（必须在 resolveIndexing 之前完成，否则工具会查到空表）
+        if (options.luaRoot) {
+            try {
+                const scanResult = await xluaBridge.fullScan();
+                console.error(`[CSG] XLua scan: ${scanResult.totalCalls} calls, ${scanResult.verified} verified, ${scanResult.unresolved} unresolved (${scanResult.duration}ms)`);
+            } catch (err) {
+                console.error(`[CSG] XLua scan failed: ${err}`);
+            }
+        }
+
+        // 索引和扫描都完成后才解除工具阻塞
         resolveIndexing!();
-        console.error('[CSG] C# indexing ready, tools unblocked');
+        console.error('[CSG] Tools unblocked');
 
         // LSP 就绪后启动文件监控
         const updateCoordinator = new UpdateCoordinator(
@@ -95,17 +111,151 @@ export async function startMcpServer(options: CsgServerOptions): Promise<void> {
 
         fileWatcher.start();
         console.error('[CSG] File watcher started');
-
-        // LSP 就绪后自动运行 XLua 扫描（填充跨语言映射缓存）
-        if (options.luaRoot) {
-            xluaBridge.fullScan().then((scanResult) => {
-                console.error(`[CSG] XLua scan: ${scanResult.totalCalls} calls, ${scanResult.verified} verified, ${scanResult.unresolved} unresolved (${scanResult.duration}ms)`);
-            }).catch((err) => {
-                console.error(`[CSG] XLua scan failed: ${err}`);
-            });
-        }
     }).catch((err) => {
         console.error(`[CSG] LSP start failed: ${err}`);
         resolveIndexing!(); // 解除工具阻塞，让它们返回 LSP_NOT_READY
     });
+}
+
+/** 代理模式：通过 HTTP 转发到 daemon 进程 */
+export async function startMcpProxyServer(daemonPort: number): Promise<void> {
+    const server = new McpServer({
+        name: 'CodeSymbolGraph',
+        version: '0.1.0',
+    });
+
+    const proxyCall = async (endpoint: string, body: Record<string, unknown>) => {
+        return new Promise<unknown>((resolve, reject) => {
+            const data = JSON.stringify(body);
+            const req = http.request({
+                hostname: '127.0.0.1',
+                port: daemonPort,
+                path: endpoint,
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+            }, (res) => {
+                const chunks: Buffer[] = [];
+                res.on('data', (chunk: Buffer) => chunks.push(chunk));
+                res.on('end', () => {
+                    try {
+                        resolve(JSON.parse(Buffer.concat(chunks).toString('utf-8')));
+                    } catch {
+                        reject(new Error('Invalid JSON from daemon'));
+                    }
+                });
+            });
+            req.on('error', reject);
+            req.write(data);
+            req.end();
+        });
+    };
+
+    const proxyGet = async (endpoint: string) => {
+        return new Promise<unknown>((resolve, reject) => {
+            const req = http.request({
+                hostname: '127.0.0.1',
+                port: daemonPort,
+                path: endpoint,
+                method: 'GET',
+            }, (res) => {
+                const chunks: Buffer[] = [];
+                res.on('data', (chunk: Buffer) => chunks.push(chunk));
+                res.on('end', () => {
+                    try {
+                        resolve(JSON.parse(Buffer.concat(chunks).toString('utf-8')));
+                    } catch {
+                        reject(new Error('Invalid JSON from daemon'));
+                    }
+                });
+            });
+            req.on('error', reject);
+            req.end();
+        });
+    };
+
+    const toMcpResult = (result: unknown) => ({
+        content: [{ type: 'text' as const, text: JSON.stringify(result) }],
+    });
+
+    // 注册代理工具（schema 与直连模式保持一致）
+    server.tool(
+        'csg_find_definition',
+        '查找符号定义位置。支持按名字搜索（如 "ItemManager"）或按文件位置精确查找。返回定义处代码片段。',
+        {
+            name: z.string().optional().describe('符号名（支持 FQN 如 "Game.ItemManager" 或短名如 "ItemManager"）'),
+            file: z.string().optional().describe('文件路径（按位置查模式）'),
+            line: z.number().optional().describe('行号 1-based（按位置查模式）'),
+            column: z.number().optional().describe('列号 0-based（按位置查模式）'),
+        },
+        async (args) => toMcpResult(await proxyCall('/api/find-definition', args)),
+    );
+
+    server.tool(
+        'csg_find_references',
+        '查找符号的所有引用。支持按名字（如 "ItemManager.AddItem"）或按位置。自动包含跨语言引用。返回引用处代码片段。',
+        {
+            name: z.string().optional().describe('符号名'),
+            file: z.string().optional().describe('文件路径'),
+            line: z.number().optional().describe('行号 1-based'),
+            column: z.number().optional().describe('列号 0-based'),
+            exclude_generated: z.boolean().optional().default(true).describe('排除 XLua/Gen、CSObjectWrap 等生成代码（默认 true）'),
+        },
+        async (args) => toMcpResult(await proxyCall('/api/find-references', args)),
+    );
+
+    server.tool(
+        'csg_call_chain',
+        '查询方法的调用链（谁调用它 / 它调用谁）。支持按名字或按位置。返回调用处代码片段。',
+        {
+            name: z.string().optional().describe('方法名'),
+            file: z.string().optional().describe('文件路径'),
+            line: z.number().optional().describe('行号 1-based'),
+            column: z.number().optional().describe('列号 0-based'),
+            direction: z.enum(['incoming', 'outgoing', 'both']).default('both'),
+            max_depth: z.number().optional().default(3).describe('最大递归深度'),
+        },
+        async (args) => toMcpResult(await proxyCall('/api/call-chain', args)),
+    );
+
+    server.tool(
+        'csg_cross_lang',
+        '查询 C# ↔ Lua 跨语言映射。输入 C# FQN 或 Lua CS.xxx 模式。返回调用处代码片段。',
+        {
+            name: z.string().describe('C# FQN 或 Lua 全局名（如 "CS.Game.ItemManager"）'),
+        },
+        async (args) => toMcpResult(await proxyCall('/api/cross-lang', args)),
+    );
+
+    server.tool(
+        'csg_impact',
+        '分析修改影响范围。支持按名字或按位置。返回 C# 引用 + Lua 跨语言调用，每条带代码片段。',
+        {
+            name: z.string().optional().describe('符号名'),
+            file: z.string().optional().describe('文件路径'),
+            line: z.number().optional().describe('行号 1-based'),
+            column: z.number().optional().describe('列号 0-based'),
+            exclude_generated: z.boolean().optional().default(true).describe('排除 XLua/Gen、CSObjectWrap 等生成代码（默认 true）'),
+        },
+        async (args) => toMcpResult(await proxyCall('/api/impact', args)),
+    );
+
+    server.tool(
+        'csg_status',
+        '查看 CodeSymbolGraph 运行状态（LSP、缓存、跨语言映射）',
+        {},
+        async () => toMcpResult(await proxyGet('/api/status')),
+    );
+
+    const cleanup = async () => {
+        console.error('[CSG] Proxy shutting down...');
+        process.exit(0);
+    };
+    process.on('SIGINT', cleanup);
+    process.on('SIGTERM', cleanup);
+
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error(`[CSG] MCP proxy server running on stdio → daemon :${daemonPort}`);
+
+    process.stdin.on('end', () => cleanup());
 }
