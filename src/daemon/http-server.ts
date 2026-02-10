@@ -11,6 +11,10 @@ import {
     handleCrossLang,
     handleImpact,
     handleStatus,
+    handleFindAsset,
+    handleFindProtocol,
+    handleCheckLua,
+    handleCheckCsharp,
 } from './query-handler.js';
 import { LspTimeoutError } from '../utils/timeout.js';
 
@@ -90,7 +94,7 @@ export class DaemonHttpServer {
                 return;
             }
 
-            // POST 端点：需要先等索引完成
+            // POST 端点
             if (req.method === 'POST') {
                 const body = await this.readBody(req);
                 let args: Record<string, unknown>;
@@ -101,20 +105,24 @@ export class DaemonHttpServer {
                     return;
                 }
 
-                // 等索引就绪（最多 90s）
-                try {
-                    await Promise.race([
-                        this.indexingReady,
-                        new Promise<never>((_, reject) =>
-                            setTimeout(() => reject(new Error('Indexing timeout')), 90_000),
-                        ),
-                    ]);
-                } catch {
-                    this.sendJson(res, 503, {
-                        success: false,
-                        error: { code: 'LSP_NOT_READY', message: 'Indexing still in progress, please retry later' },
-                    });
-                    return;
+                // find-asset 和 find-protocol 不依赖 LSP 索引，可立即响应
+                const noWaitEndpoints = ['/api/find-asset', '/api/find-protocol'];
+                if (!noWaitEndpoints.includes(pathname)) {
+                    // 等索引就绪（最多 90s）
+                    try {
+                        await Promise.race([
+                            this.indexingReady,
+                            new Promise<never>((_, reject) =>
+                                setTimeout(() => reject(new Error('Indexing timeout')), 90_000),
+                            ),
+                        ]);
+                    } catch {
+                        this.sendJson(res, 503, {
+                            success: false,
+                            error: { code: 'LSP_NOT_READY', message: 'Indexing still in progress, please retry later' },
+                        });
+                        return;
+                    }
                 }
 
                 const result = await this.routePost(pathname, args);
@@ -158,6 +166,14 @@ export class DaemonHttpServer {
                 return handleCrossLang(this.ctx, args as any);
             case '/api/impact':
                 return handleImpact(this.ctx, args as any);
+            case '/api/find-asset':
+                return handleFindAsset(this.ctx, args as any);
+            case '/api/find-protocol':
+                return handleFindProtocol(this.ctx, args as any);
+            case '/api/check-lua':
+                return handleCheckLua(this.ctx, args as any);
+            case '/api/check-csharp':
+                return handleCheckCsharp(this.ctx, args as any);
             default:
                 return null;
         }

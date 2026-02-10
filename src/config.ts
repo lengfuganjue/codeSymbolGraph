@@ -10,6 +10,10 @@ export interface CsgConfig {
     csharpLsp: 'csharp-ls' | 'omnisharp';
     csharpLspPath: string | null;
     lualsPath: string | null;
+    /** 资源名映射文件路径（可选，默认自动检测 AssetsNameToolCacheFile.txt） */
+    assetsNameFile?: string;
+    /** 协议注解目录路径（可选，默认自动检测 EmmyLuaAnnotations/） */
+    protocolAnnotationsDir?: string;
     /** 可选的高级调优参数 */
     advanced?: Partial<AdvancedConfig>;
 }

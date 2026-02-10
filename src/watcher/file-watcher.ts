@@ -14,6 +14,10 @@ export class FileWatcher extends EventEmitter {
     private debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
     private pendingChanges = new Map<string, FileChange>();
     private debounceMs: number;
+    /** 额外监控的文件路径（资源映射文件、注解目录等） */
+    private extraWatchPaths: string[] = [];
+    /** 额外文件变更回调 */
+    private extraChangeCallbacks = new Map<string, () => void>();
 
     constructor(
         private workspaceRoot: string,
@@ -23,10 +27,17 @@ export class FileWatcher extends EventEmitter {
         this.debounceMs = options?.debounceMs ?? 500;
     }
 
+    /** 添加额外监控文件，变更时调用 callback */
+    addExtraWatch(filePath: string, callback: () => void): void {
+        this.extraWatchPaths.push(filePath);
+        this.extraChangeCallbacks.set(path.resolve(filePath).replace(/\\/g, '/'), callback);
+    }
+
     start(): void {
         const watchPaths = [
             path.join(this.workspaceRoot, '**/*.cs'),
             path.join(this.workspaceRoot, '**/*.lua'),
+            ...this.extraWatchPaths,
         ];
 
         this.watcher = watch(watchPaths, {
@@ -70,6 +81,13 @@ export class FileWatcher extends EventEmitter {
 
     private handleEvent(type: FileChange['type'], absolutePath: string): void {
         const normalized = absolutePath.replace(/\\/g, '/');
+
+        // 检查是否是额外监控的文件
+        const extraCallback = this.extraChangeCallbacks.get(normalized);
+        if (extraCallback) {
+            extraCallback();
+            return;
+        }
 
         if (!isSupportedFile(normalized)) return;
 

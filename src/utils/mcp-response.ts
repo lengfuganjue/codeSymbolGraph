@@ -1,6 +1,6 @@
 import type { LspState } from '../lsp/lsp-client.js';
 
-export type McpErrorCode = 'LSP_TIMEOUT' | 'LSP_NOT_READY' | 'NO_MATCH' | 'INTERNAL_ERROR';
+export type McpErrorCode = 'LSP_TIMEOUT' | 'LSP_NOT_READY' | 'NO_MATCH' | 'NOT_AVAILABLE' | 'INTERNAL_ERROR';
 
 export interface McpToolResponse<T = unknown> {
     success: boolean;

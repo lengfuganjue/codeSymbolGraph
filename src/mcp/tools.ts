@@ -15,7 +15,13 @@ import {
     handleCrossLang,
     handleImpact,
     handleStatus,
+    handleFindAsset,
+    handleFindProtocol,
+    handleCheckLua,
+    handleCheckCsharp,
 } from '../daemon/query-handler.js';
+import type { AssetIndex } from '../core/asset-index.js';
+import type { ProtocolIndex } from '../core/protocol-index.js';
 
 const INDEXING_WAIT_TIMEOUT = 90_000;
 
@@ -79,8 +85,10 @@ export function registerTools(
     cache: CacheManager,
     workspaceRoot: string,
     indexingReady: Promise<void>,
+    assetIndex?: AssetIndex,
+    protocolIndex?: ProtocolIndex,
 ): void {
-    const ctx: QueryContext = { queryService, xluaBridge, lspManager, cache, workspaceRoot };
+    const ctx: QueryContext = { queryService, xluaBridge, lspManager, cache, workspaceRoot, assetIndex, protocolIndex };
 
     // ===== csg_find_definition =====
     server.tool(
@@ -172,5 +180,62 @@ export function registerTools(
                 }],
             };
         },
+    );
+
+    // ===== csg_find_asset =====
+    server.tool(
+        'csg_find_asset',
+        '按资源短名查找完整路径。支持精确匹配和模糊搜索。例如查找 "music_city" 返回资源完整路径。',
+        {
+            name: z.string().describe('资源短名（如 "music_city.wav" 或 "uniquetype"）'),
+        },
+        async (args) => {
+            const result = await handleFindAsset(ctx, args);
+            return {
+                content: [{ type: 'text' as const, text: JSON.stringify(result) }],
+            };
+        },
+    );
+
+    // ===== csg_find_protocol =====
+    server.tool(
+        'csg_find_protocol',
+        '查询 Protobuf 消息定义或配置表 schema。支持按类名或字段名搜索。返回类定义和所有字段。',
+        {
+            name: z.string().describe('协议/配置表类名（如 "PbNpcDataConfig"、"account_settings"）'),
+            field: z.string().optional().describe('按字段名搜索（返回包含此字段的所有类）'),
+        },
+        async (args) => {
+            const result = await handleFindProtocol(ctx, args);
+            return {
+                content: [{ type: 'text' as const, text: JSON.stringify(result) }],
+            };
+        },
+    );
+
+    // ===== csg_check_lua =====
+    server.tool(
+        'csg_check_lua',
+        '对 Lua 文件执行静态检查（LuaLS diagnostics）。返回错误和警告列表。',
+        {
+            file: z.string().describe('Lua 文件路径（相对或绝对）'),
+            severity: z.enum(['error', 'warning', 'all']).optional().default('all').describe('返回的诊断级别'),
+        },
+        async (args) => wrapTool(lspManager, indexingReady, () =>
+            handleCheckLua(ctx, args),
+        ),
+    );
+
+    // ===== csg_check_csharp =====
+    server.tool(
+        'csg_check_csharp',
+        '对 C# 文件执行编译检查。返回编译错误和警告列表。',
+        {
+            file: z.string().describe('C# 文件路径（相对或绝对）'),
+            severity: z.enum(['error', 'warning', 'all']).optional().default('all').describe('返回的诊断级别'),
+        },
+        async (args) => wrapTool(lspManager, indexingReady, () =>
+            handleCheckCsharp(ctx, args),
+        ),
     );
 }

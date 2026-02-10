@@ -17,6 +17,8 @@ import { DaemonHttpServer, DEFAULT_PORT } from '../daemon/http-server.js';
 import { type CsgConfig, type AdvancedConfig, resolveAdvanced } from '../config.js';
 import { setTimeouts } from '../utils/timeout.js';
 import { isUnityOldFormat, convertUnityProject } from '../utils/unity-csproj.js';
+import { AssetIndex } from '../core/asset-index.js';
+import { ProtocolIndex } from '../core/protocol-index.js';
 
 const CONFIG_DIR = '.codesymbolgraph';
 const CONFIG_FILE = 'config.json';
@@ -98,6 +100,30 @@ async function loadConfig(): Promise<{ config: CsgConfig; adv: AdvancedConfig }>
         console.error('Config not found. Run "csg init" first.');
         process.exit(1);
     }
+}
+
+/** 自动检测资源名映射文件路径 */
+async function detectAssetsFile(workspaceRoot: string, config: CsgConfig): Promise<string | null> {
+    if (config.assetsNameFile) {
+        const p = path.resolve(workspaceRoot, config.assetsNameFile);
+        try { await fs.access(p); return p; } catch { return null; }
+    }
+    const candidate = path.join(workspaceRoot, 'AssetsNameToolCacheFile.txt');
+    try { await fs.access(candidate); return candidate; } catch { return null; }
+}
+
+/** 自动检测协议注解目录 */
+async function detectAnnotationsDir(workspaceRoot: string, config: CsgConfig): Promise<string | null> {
+    if (config.protocolAnnotationsDir) {
+        const p = path.resolve(workspaceRoot, config.protocolAnnotationsDir);
+        try { await fs.access(p); return p; } catch { return null; }
+    }
+    const candidates = ['EmmyLuaAnnotations', 'Lua/EmmyLuaAnnotations'];
+    for (const dir of candidates) {
+        const p = path.join(workspaceRoot, dir);
+        try { await fs.access(p); return p; } catch { /* continue */ }
+    }
+    return null;
 }
 
 /**
@@ -378,6 +404,22 @@ program
             console.log(`[${e.level}] ${e.message}`);
         });
 
+        // 初始化资源索引和协议索引
+        const assetIndex = new AssetIndex();
+        const protocolIndex = new ProtocolIndex();
+
+        const assetsFile = await detectAssetsFile(workspaceRoot, config);
+        if (assetsFile) {
+            await assetIndex.load(assetsFile);
+            console.log(`Asset index: ${assetIndex.size} entries loaded`);
+        }
+
+        const annotationsDir = await detectAnnotationsDir(workspaceRoot, config);
+        if (annotationsDir) {
+            await protocolIndex.load(annotationsDir);
+            console.log(`Protocol index: ${protocolIndex.size} classes loaded`);
+        }
+
         // 索引就绪 Promise
         let resolveIndexing: () => void;
         const indexingReady = new Promise<void>(r => { resolveIndexing = r; });
@@ -385,7 +427,7 @@ program
         // 启动 HTTP 服务器
         const httpServer = new DaemonHttpServer({
             port,
-            ctx: { queryService, xluaBridge, lspManager, cache, workspaceRoot },
+            ctx: { queryService, xluaBridge, lspManager, cache, workspaceRoot, assetIndex, protocolIndex },
             indexingReady,
             onLog: (level, msg) => console.log(`[HTTP] [${level}] ${msg}`),
         });
@@ -454,6 +496,24 @@ program
             debounceMs: adv.fileWatcherDebounceMs,
         });
 
+        // 监控资源映射文件变更
+        if (assetsFile) {
+            fileWatcher.addExtraWatch(assetsFile, () => {
+                assetIndex.reload().then(() => {
+                    console.log(`[update] Asset index reloaded: ${assetIndex.size} entries`);
+                }).catch(err => console.error(`Asset reload failed: ${err}`));
+            });
+        }
+
+        // 监控注解目录变更
+        if (annotationsDir) {
+            fileWatcher.addExtraWatch(path.join(annotationsDir, '**/*.lua'), () => {
+                protocolIndex.reload().then(() => {
+                    console.log(`[update] Protocol index reloaded: ${protocolIndex.size} classes`);
+                }).catch(err => console.error(`Protocol reload failed: ${err}`));
+            });
+        }
+
         fileWatcher.on('changes', async (changes: import('../watcher/file-watcher.js').FileChange[]) => {
             const result = await updateCoordinator.processChanges(changes);
             console.log(`[update] ${result.filesProcessed} files processed (${result.duration}ms)`);
@@ -485,6 +545,22 @@ program
         }
 
         console.error('[CSG] No daemon detected, starting in standalone mode');
+
+        // 初始化资源索引和协议索引
+        const assetIndex = new AssetIndex();
+        const protocolIndex = new ProtocolIndex();
+
+        const assetsFile = await detectAssetsFile(workspaceRoot, config);
+        if (assetsFile) {
+            await assetIndex.load(assetsFile);
+            console.error(`[CSG] Asset index: ${assetIndex.size} entries`);
+        }
+        const annotationsDir = await detectAnnotationsDir(workspaceRoot, config);
+        if (annotationsDir) {
+            await protocolIndex.load(annotationsDir);
+            console.error(`[CSG] Protocol index: ${protocolIndex.size} classes`);
+        }
+
         await startMcpServer({
             workspaceRoot,
             dbPath,
@@ -505,6 +581,8 @@ program
                 callChainCacheTtlSeconds: adv.callChainCacheTtlSeconds,
             },
             fileWatcherDebounceMs: adv.fileWatcherDebounceMs,
+            assetIndex,
+            protocolIndex,
         });
     });
 
@@ -653,6 +731,10 @@ program
             'call-chain': { endpoint: '/api/call-chain', method: 'POST' },
             'cross-lang': { endpoint: '/api/cross-lang', method: 'POST' },
             'impact': { endpoint: '/api/impact', method: 'POST' },
+            'find-asset': { endpoint: '/api/find-asset', method: 'POST' },
+            'find-protocol': { endpoint: '/api/find-protocol', method: 'POST' },
+            'check-lua': { endpoint: '/api/check-lua', method: 'POST' },
+            'check-csharp': { endpoint: '/api/check-csharp', method: 'POST' },
         };
 
         const mapping = toolMap[tool];
@@ -682,7 +764,9 @@ program
                         }
                     }
                 } else {
-                    body.name = queryArgs[0];
+                    // check-lua/check-csharp 的第一个参数是 file，其他工具是 name
+                    const firstArgKey = (tool === 'check-lua' || tool === 'check-csharp') ? 'file' : 'name';
+                    body[firstArgKey] = queryArgs[0];
                 }
             }
         }
@@ -795,6 +879,53 @@ function formatQueryResult(tool: string, result: unknown): void {
             if (crossImpact.length > 0) {
                 console.log(`\nCross-language impact: ${crossImpact.length} Lua call site(s)`);
             }
+            break;
+        }
+
+        case 'find-asset': {
+            const assets = data?.results || [];
+            for (const a of assets) {
+                console.log(`${a.shortName}:`);
+                for (const p of a.fullPaths) {
+                    console.log(`  ${p}`);
+                }
+            }
+            console.log(`\n${data?.count || 0} asset(s) found`);
+            break;
+        }
+
+        case 'find-protocol': {
+            const classes = data?.classes || [];
+            for (const c of classes) {
+                console.log(`${c.name} [${c.source}] ${c.comment ? '— ' + c.comment : ''}`);
+                console.log(`  file: ${c.file}:${c.line}`);
+                for (const f of c.fields.slice(0, 20)) {
+                    console.log(`  ${f.name}: ${f.type}${f.comment ? '  // ' + f.comment : ''}`);
+                }
+                if (c.fields.length > 20) console.log(`  ... ${c.fields.length - 20} more fields`);
+            }
+            console.log(`\n${data?.count || 0} class(es) found`);
+            break;
+        }
+
+        case 'check-lua':
+        case 'check-csharp': {
+            console.log(`File: ${data?.file}`);
+            const errors = data?.errors || [];
+            const warnings = data?.warnings || [];
+            if (errors.length > 0) {
+                console.log(`\nErrors (${errors.length}):`);
+                for (const e of errors.slice(0, 30)) {
+                    console.log(`  L${e.line}: ${e.message}`);
+                }
+            }
+            if (warnings.length > 0) {
+                console.log(`\nWarnings (${warnings.length}):`);
+                for (const w of warnings.slice(0, 30)) {
+                    console.log(`  L${w.line}: ${w.message}`);
+                }
+            }
+            console.log(`\nTotal: ${data?.total || 0} diagnostic(s)`);
             break;
         }
 

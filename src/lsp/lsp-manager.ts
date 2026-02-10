@@ -2,6 +2,9 @@ import { LspClient, type LspClientOptions, type LspState } from './lsp-client.js
 import { OpenFileTracker } from './open-file-tracker.js';
 import { EventEmitter } from 'events';
 import * as path from 'path';
+import * as fs from 'fs/promises';
+import { pathToUri } from '../utils/uri.js';
+import type { Diagnostic } from 'vscode-languageserver-protocol/node.js';
 
 export type CSharpLspKind = 'csharp-ls' | 'omnisharp';
 
@@ -205,6 +208,38 @@ export class LspManager extends EventEmitter {
         });
     }
 
+    /**
+     * 检查单个文件的诊断信息。
+     * didOpen 文件后等待 LSP 推送 publishDiagnostics。
+     */
+    async checkFile(file: string): Promise<{
+        file: string;
+        errors: Diagnostic[];
+        warnings: Diagnostic[];
+        hints: Diagnostic[];
+    }> {
+        const client = this.getClientForFile(file);
+        const tracker = this.getTrackerForFile(file);
+        const absolutePath = path.isAbsolute(file) ? file : path.resolve(this.options.workspaceRoot, file);
+        const uri = pathToUri(absolutePath);
+        const langId = file.endsWith('.cs') ? 'csharp' : 'lua';
+
+        const content = await fs.readFile(absolutePath, 'utf-8');
+
+        // 使用 tracker 自动处理 open/change 状态
+        await tracker.notifyChange(client, uri, langId, content);
+
+        // 等待诊断推送
+        const diagnostics = await client.waitForDiagnostics(uri, 5000);
+
+        return {
+            file,
+            errors: diagnostics.filter(d => d.severity === 1),
+            warnings: diagnostics.filter(d => d.severity === 2),
+            hints: diagnostics.filter(d => d.severity != null && d.severity >= 3),
+        };
+    }
+
     private getCSharpOptions(): LspClientOptions {
         const kind = this.options.csharpLsp || 'csharp-ls';
 
@@ -268,7 +303,7 @@ export class LspManager extends EventEmitter {
                             preloadFileSize: this.options.lualsPreloadFileSize ?? 500,
                         },
                         runtime: { version: this.options.luaVersion ?? 'Lua 5.3' },
-                        diagnostics: { enable: false },
+                        diagnostics: { enable: true },
                     },
                 },
             },

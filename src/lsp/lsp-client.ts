@@ -29,6 +29,7 @@ import {
 } from 'vscode-languageserver-protocol/node.js';
 import { spawn, type ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
+import type { Diagnostic, PublishDiagnosticsParams } from 'vscode-languageserver-protocol/node.js';
 import { withTimeout, LSP_TIMEOUT_MS, LSP_INIT_TIMEOUT_MS } from '../utils/timeout.js';
 import { pathToUri } from '../utils/uri.js';
 
@@ -54,6 +55,8 @@ export class LspClient extends EventEmitter {
     private restartCount = 0;
     private healthTimer: ReturnType<typeof setInterval> | null = null;
     private _capabilities: InitializeResult | null = null;
+    private diagnosticsMap = new Map<string, Diagnostic[]>();
+    private diagnosticsEmitter = new EventEmitter();
 
     constructor(private options: LspClientOptions) {
         super();
@@ -98,6 +101,14 @@ export class LspClient extends EventEmitter {
             this.connection.onRequest('client/unregisterCapability', () => ({}));
             this.connection.onRequest('workspace/configuration', () => [{}]);
             this.connection.onRequest('window/workDoneProgress/create', () => ({}));
+
+            // 接收诊断推送
+            this.connection.onNotification('textDocument/publishDiagnostics',
+                (params: PublishDiagnosticsParams) => {
+                    this.diagnosticsMap.set(params.uri, params.diagnostics);
+                    this.diagnosticsEmitter.emit('update', params.uri);
+                },
+            );
 
             this.connection.listen();
 
@@ -290,6 +301,43 @@ export class LspClient extends EventEmitter {
         this.ensureReady();
         await this.connection!.sendNotification(DidSaveTextDocumentNotification.type, {
             textDocument: { uri },
+        });
+    }
+
+    // ===== 诊断查询 =====
+
+    getDiagnostics(uri: string): Diagnostic[] {
+        return this.diagnosticsMap.get(uri) || [];
+    }
+
+    getAllDiagnostics(): Map<string, Diagnostic[]> {
+        return new Map(this.diagnosticsMap);
+    }
+
+    /**
+     * 等待指定 URI 的诊断推送。
+     * 如果已有缓存的诊断结果，直接返回；否则等待下一次推送或超时。
+     */
+    waitForDiagnostics(uri: string, timeoutMs = 5000): Promise<Diagnostic[]> {
+        const cached = this.diagnosticsMap.get(uri);
+        if (cached && cached.length > 0) {
+            return Promise.resolve(cached);
+        }
+
+        return new Promise<Diagnostic[]>((resolve) => {
+            const timer = setTimeout(() => {
+                this.diagnosticsEmitter.removeListener('update', handler);
+                resolve(this.diagnosticsMap.get(uri) || []);
+            }, timeoutMs);
+
+            const handler = (updatedUri: string) => {
+                if (updatedUri === uri) {
+                    clearTimeout(timer);
+                    this.diagnosticsEmitter.removeListener('update', handler);
+                    resolve(this.diagnosticsMap.get(uri) || []);
+                }
+            };
+            this.diagnosticsEmitter.on('update', handler);
         });
     }
 

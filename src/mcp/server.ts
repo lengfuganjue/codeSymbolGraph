@@ -9,6 +9,8 @@ import { FileWatcher } from '../watcher/file-watcher.js';
 import { UpdateCoordinator } from '../core/update-coordinator.js';
 import { registerTools } from './tools.js';
 import { z } from 'zod';
+import type { AssetIndex } from '../core/asset-index.js';
+import type { ProtocolIndex } from '../core/protocol-index.js';
 
 export interface CsgServerOptions extends LspManagerOptions {
     dbPath: string;
@@ -16,6 +18,8 @@ export interface CsgServerOptions extends LspManagerOptions {
     extraThirdPartyNamespaces?: string[];
     cacheOptions?: CacheManagerOptions;
     fileWatcherDebounceMs?: number;
+    assetIndex?: AssetIndex;
+    protocolIndex?: ProtocolIndex;
 }
 
 /** 独立模式：本地启动 LSP，直接处理查询 */
@@ -44,7 +48,7 @@ export async function startMcpServer(options: CsgServerOptions): Promise<void> {
     const indexingReady = new Promise<void>(r => { resolveIndexing = r; });
 
     // 注册 MCP 工具
-    registerTools(server, queryService, xluaBridge, lspManager, cache, options.workspaceRoot, indexingReady);
+    registerTools(server, queryService, xluaBridge, lspManager, cache, options.workspaceRoot, indexingReady, options.assetIndex, options.protocolIndex);
 
     // 清理函数：立即可用，fileWatcher 启动后补充
     let fileWatcher: FileWatcher | null = null;
@@ -244,6 +248,45 @@ export async function startMcpProxyServer(daemonPort: number): Promise<void> {
         '查看 CodeSymbolGraph 运行状态（LSP、缓存、跨语言映射）',
         {},
         async () => toMcpResult(await proxyGet('/api/status')),
+    );
+
+    server.tool(
+        'csg_find_asset',
+        '按资源短名查找完整路径。支持精确匹配和模糊搜索。例如查找 "music_city" 返回资源完整路径。',
+        {
+            name: z.string().describe('资源短名（如 "music_city.wav" 或 "uniquetype"）'),
+        },
+        async (args) => toMcpResult(await proxyCall('/api/find-asset', args)),
+    );
+
+    server.tool(
+        'csg_find_protocol',
+        '查询 Protobuf 消息定义或配置表 schema。支持按类名或字段名搜索。返回类定义和所有字段。',
+        {
+            name: z.string().describe('协议/配置表类名（如 "PbNpcDataConfig"、"account_settings"）'),
+            field: z.string().optional().describe('按字段名搜索（返回包含此字段的所有类）'),
+        },
+        async (args) => toMcpResult(await proxyCall('/api/find-protocol', args)),
+    );
+
+    server.tool(
+        'csg_check_lua',
+        '对 Lua 文件执行静态检查（LuaLS diagnostics）。返回错误和警告列表。',
+        {
+            file: z.string().describe('Lua 文件路径（相对或绝对）'),
+            severity: z.enum(['error', 'warning', 'all']).optional().default('all').describe('返回的诊断级别'),
+        },
+        async (args) => toMcpResult(await proxyCall('/api/check-lua', args)),
+    );
+
+    server.tool(
+        'csg_check_csharp',
+        '对 C# 文件执行编译检查。返回编译错误和警告列表。',
+        {
+            file: z.string().describe('C# 文件路径（相对或绝对）'),
+            severity: z.enum(['error', 'warning', 'all']).optional().default('all').describe('返回的诊断级别'),
+        },
+        async (args) => toMcpResult(await proxyCall('/api/check-csharp', args)),
     );
 
     const cleanup = async () => {

@@ -9,6 +9,8 @@ import { CacheManager } from '../cache/cache-manager.js';
 import { successResponse, errorResponse, type McpToolResponse } from '../utils/mcp-response.js';
 import { readSnippet, clearSnippetCache } from '../utils/snippet.js';
 import type { CallChainNode } from '../core/query-service.js';
+import type { AssetIndex } from '../core/asset-index.js';
+import type { ProtocolIndex } from '../core/protocol-index.js';
 
 export interface QueryContext {
     queryService: QueryService;
@@ -16,6 +18,8 @@ export interface QueryContext {
     lspManager: LspManager;
     cache: CacheManager;
     workspaceRoot: string;
+    assetIndex?: AssetIndex;
+    protocolIndex?: ProtocolIndex;
 }
 
 export async function handleFindDefinition(
@@ -240,4 +244,128 @@ export async function handleStatus(
     const lspStatus = ctx.lspManager.getStatus();
     const cacheStats = ctx.cache.getStats();
     return successResponse({ lsp: lspStatus, cache: cacheStats });
+}
+
+export async function handleFindAsset(
+    ctx: QueryContext,
+    args: { name: string },
+): Promise<McpToolResponse> {
+    const lspStatus = ctx.lspManager.getLspStatusForMcp();
+
+    if (!ctx.assetIndex?.isLoaded) {
+        return errorResponse('NOT_AVAILABLE', 'Asset index not loaded (no AssetsNameToolCacheFile.txt found)', lspStatus);
+    }
+
+    const results = ctx.assetIndex.find(args.name);
+    if (results.length === 0) {
+        return errorResponse('NO_MATCH', `No asset found matching: ${args.name}`, lspStatus);
+    }
+
+    return successResponse({
+        results: results.map(r => ({ shortName: r.shortName, fullPaths: r.fullPaths })),
+        count: results.length,
+    });
+}
+
+export async function handleFindProtocol(
+    ctx: QueryContext,
+    args: { name: string; field?: string },
+): Promise<McpToolResponse> {
+    const lspStatus = ctx.lspManager.getLspStatusForMcp();
+
+    if (!ctx.protocolIndex?.isLoaded) {
+        return errorResponse('NOT_AVAILABLE', 'Protocol index not loaded (no EmmyLuaAnnotations directory found)', lspStatus);
+    }
+
+    const classes = ctx.protocolIndex.find(args.name, args.field);
+    if (classes.length === 0) {
+        const desc = args.field ? `field "${args.field}"` : `"${args.name}"`;
+        return errorResponse('NO_MATCH', `No protocol/config found matching: ${desc}`, lspStatus);
+    }
+
+    return successResponse({
+        classes: classes.map(c => ({
+            name: c.name,
+            comment: c.comment,
+            source: c.source,
+            file: c.file,
+            line: c.line,
+            fields: c.fields,
+        })),
+        count: classes.length,
+    });
+}
+
+export async function handleCheckLua(
+    ctx: QueryContext,
+    args: { file: string; severity?: string },
+): Promise<McpToolResponse> {
+    const result = await ctx.lspManager.checkFile(args.file);
+    const severity = args.severity || 'all';
+
+    const diagnostics: { errors: unknown[]; warnings: unknown[] } = {
+        errors: result.errors.map(d => ({
+            line: d.range.start.line + 1,
+            message: d.message,
+            source: d.source,
+        })),
+        warnings: result.warnings.map(d => ({
+            line: d.range.start.line + 1,
+            message: d.message,
+            source: d.source,
+        })),
+    };
+
+    const data: Record<string, unknown> = { file: result.file };
+    if (severity === 'error') {
+        data.errors = diagnostics.errors;
+        data.total = diagnostics.errors.length;
+    } else if (severity === 'warning') {
+        data.errors = diagnostics.errors;
+        data.warnings = diagnostics.warnings;
+        data.total = diagnostics.errors.length + diagnostics.warnings.length;
+    } else {
+        data.errors = diagnostics.errors;
+        data.warnings = diagnostics.warnings;
+        data.total = diagnostics.errors.length + diagnostics.warnings.length;
+    }
+
+    return successResponse(data);
+}
+
+export async function handleCheckCsharp(
+    ctx: QueryContext,
+    args: { file: string; severity?: string },
+): Promise<McpToolResponse> {
+    const result = await ctx.lspManager.checkFile(args.file);
+    const severity = args.severity || 'all';
+
+    const diagnostics: { errors: unknown[]; warnings: unknown[] } = {
+        errors: result.errors.map(d => ({
+            line: d.range.start.line + 1,
+            message: d.message,
+            source: d.source,
+        })),
+        warnings: result.warnings.map(d => ({
+            line: d.range.start.line + 1,
+            message: d.message,
+            source: d.source,
+        })),
+    };
+
+    const data: Record<string, unknown> = { file: result.file };
+    if (severity === 'error') {
+        data.errors = diagnostics.errors;
+        data.total = diagnostics.errors.length;
+    } else if (severity === 'warning') {
+        data.errors = diagnostics.errors;
+        data.warnings = diagnostics.warnings;
+        data.total = diagnostics.errors.length + diagnostics.warnings.length;
+    } else {
+        data.errors = diagnostics.errors;
+        data.warnings = diagnostics.warnings;
+        data.total = diagnostics.errors.length + diagnostics.warnings.length;
+    }
+
+    return successResponse(data);
 }
