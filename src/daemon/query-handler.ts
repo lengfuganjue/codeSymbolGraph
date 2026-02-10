@@ -333,7 +333,7 @@ export async function handleCheckLua(
     return successResponse(data);
 }
 
-/** 匹配 Unity 程序集缺失导致的噪音错误（CS0246/CS0234/CS0103/CS0115 等） */
+/** 匹配 Unity 程序集缺失导致的噪音错误（CS0246/CS0234/CS0103/CS0115/CS0029/CS0019 等） */
 const UNITY_NOISE_PATTERNS = [
     // CS0246: 未能找到类型或命名空间名
     /未能找到类型或命名空间名/,
@@ -350,6 +350,12 @@ const UNITY_NOISE_PATTERNS = [
     // CS0246/CS1061: 缺少程序集引用导致的成员找不到
     /是否缺少 using 指令或程序集引用/,
     /are you missing a using directive or an assembly reference/i,
+    // CS0029: 隐式转换为 bool（UnityEngine.Object 重载了 implicit bool，csharp-ls 看不到）
+    /无法将类型.+隐式转换为/,
+    /cannot implicitly convert type/i,
+    // CS0019: 运算符无法应用（缺少 Unity 值类型的运算符重载）
+    /运算符.+无法应用于/,
+    /operator .+ cannot be applied to operands of type/i,
 ];
 
 function isUnityNoiseError(message: string): boolean {
