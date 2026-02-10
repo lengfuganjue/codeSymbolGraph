@@ -7,9 +7,26 @@ import * as path from 'path';
 import { glob } from 'glob';
 import type { SymbolInformation } from 'vscode-languageserver-protocol';
 
+/** 直接 CS. 调用: CS.Namespace.Class:method() 或 CS.Namespace.Class.method() */
 const CS_CALL_PATTERN = /CS\.([\w.]+)[:\.](\w+)\s*\(/g;
-const CS_ALIAS_PATTERN = /local\s+(\w+)\s*=\s*CS\.([\w.]+)\s*$/gm;
-const CS_GLOBAL_ALIAS_PATTERN = /^\s*(\w+)\s*=\s*CS\.([\w.]+)\s*$/gm;
+
+/** 通过别名的调用: identifier:method() 或 identifier.method() */
+const ALIAS_CALL_PATTERN = /\b(\w+)\s*[:.]\s*(\w+)\s*\(/g;
+
+/**
+ * 原始赋值提取：捕获 global 和 local 别名定义
+ * 匹配: varName = value.with.dots 或 local varName = value.with.dots
+ * 值部分用 [\w.]+ 只匹配标识符和点，不会吃到注释/空格
+ */
+const RAW_GLOBAL_ALIAS = /^\s*(\w+)\s*=\s*((?:CS\.)?[\w.]+)/gm;
+const RAW_LOCAL_ALIAS = /\blocal\s+(\w+)\s*=\s*((?:CS\.)?[\w.]+)/gm;
+
+interface RawAlias {
+    name: string;
+    value: string;  // 原始右值，未解析
+    file: string;
+    line: number;
+}
 
 interface XLuaCall {
     pattern: string;
@@ -39,6 +56,7 @@ export interface ScanResult {
     verified: number;
     unresolved: number;
     aliases: number;
+    aliasCallsFound: number;
     duration: number;
 }
 
@@ -82,6 +100,8 @@ function classifyUnresolved(className: string, thirdPartyNs: string[]): string {
 export class XLuaBridge {
     private luaRoot: string;
     private thirdPartyNs: string[];
+    /** fullScan 后保存的已解析别名表，供 updateFile 复用 */
+    private aliasLookup = new Map<string, string>();
 
     constructor(
         private lspManager: LspManager,
@@ -97,31 +117,63 @@ export class XLuaBridge {
 
     async fullScan(): Promise<ScanResult> {
         const result: ScanResult = {
-            totalCalls: 0, verified: 0, unresolved: 0, aliases: 0, duration: 0,
+            totalCalls: 0, verified: 0, unresolved: 0, aliases: 0,
+            aliasCallsFound: 0, duration: 0,
         };
         const startTime = Date.now();
 
+        // ===== 读取所有文件 =====
         const luaFiles = await glob('**/*.lua', {
             cwd: this.luaRoot,
             absolute: false,
         });
 
-        const allCalls: XLuaCall[] = [];
-        const allAliases: XLuaAlias[] = [];
-
+        const fileContents = new Map<string, string>();
         for (const file of luaFiles) {
             const absPath = path.join(this.luaRoot, file);
             const content = await fs.readFile(absPath, 'utf-8');
-            allCalls.push(...this.extractCsCalls(file, content));
-            allAliases.push(...this.extractAliases(file, content));
+            fileContents.set(file, content);
+        }
+        // ===== Phase 1: 提取所有原始别名 =====
+        const rawAliases: RawAlias[] = [];
+        for (const [file, content] of fileContents) {
+            rawAliases.push(...this.extractRawAliases(file, content));
         }
 
-        result.totalCalls = allCalls.length;
+        // ===== Phase 2: 解析别名链 =====
+        this.aliasLookup = this.resolveAliasChains(rawAliases);
+        console.error(`[CSG] alias chain: ${rawAliases.length} raw → ${this.aliasLookup.size} resolved`);
+
+        // ===== Phase 3: 提取调用，分离直接调用和别名调用 =====
+        const directCalls: XLuaCall[] = [];
+        const aliasCalls: XLuaCall[] = [];
+        for (const [file, content] of fileContents) {
+            directCalls.push(...this.extractCsCalls(file, content));
+            aliasCalls.push(...this.extractAliasCalls(file, content, this.aliasLookup));
+        }
+        const dedupDirect = this.deduplicateCalls(directCalls);
+        const dedupAlias = this.deduplicateCalls(aliasCalls);
+
+        result.totalCalls = dedupDirect.length + dedupAlias.length;
+        result.aliasCallsFound = dedupAlias.length;
+
+        // ===== Phase 4: 构建别名 DB 记录（只存已解析的） =====
+        const allAliases: XLuaAlias[] = [];
+        for (const raw of rawAliases) {
+            const resolved = this.aliasLookup.get(raw.name);
+            if (resolved) {
+                allAliases.push({
+                    aliasName: raw.name,
+                    originalPattern: resolved,
+                    file: raw.file,
+                    line: raw.line,
+                });
+            }
+        }
         result.aliases = allAliases.length;
 
-        await this.enrichCallerInfo(allCalls);
-
-        const verifyResults = await this.batchVerifyWithCSharp(allCalls);
+        // ===== Phase 5: 验证直接 CS. 调用（workspaceSymbol 慢，别名调用按命名空间分类即可） =====
+        const verifyResults = await this.batchVerifyWithCSharp(dedupDirect);
 
         const insertVerified = this.cache.db.prepare(`
             INSERT OR REPLACE INTO xlua_mappings
@@ -139,7 +191,8 @@ export class XLuaBridge {
         `);
 
         const transaction = this.cache.db.transaction(() => {
-            for (const call of allCalls) {
+            // 直接 CS. 调用：用 workspaceSymbol 验证结果
+            for (const call of dedupDirect) {
                 const verified = verifyResults.get(
                     `${call.className}.${call.memberName}`,
                 );
@@ -158,6 +211,23 @@ export class XLuaBridge {
                         call.pattern, call.file, call.line, call.callerFqn ?? null, '', status,
                     );
                 }
+            }
+
+            // 别名调用：别名链已解析为完整 FQN，按命名空间分类（不做 workspaceSymbol 验证）
+            const insertAliasResolved = this.cache.db.prepare(`
+                INSERT OR REPLACE INTO xlua_mappings
+                (lua_call_pattern, lua_file, lua_line, lua_caller_fqn,
+                 lua_file_hash, csharp_fqn, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            `);
+            for (const call of dedupAlias) {
+                const fqn = `${call.className}.${call.memberName}`;
+                const nsStatus = classifyUnresolved(call.className, this.thirdPartyNs);
+                const status = nsStatus === 'unresolved' ? 'alias_resolved' : nsStatus;
+                insertAliasResolved.run(
+                    call.pattern, call.file, call.line, call.callerFqn ?? null,
+                    '', fqn, status,
+                );
             }
 
             for (const alias of allAliases) {
@@ -183,15 +253,42 @@ export class XLuaBridge {
         this.cache.db.prepare('DELETE FROM lua_aliases WHERE alias_file = ?')
             .run(filePath);
 
-        const calls = this.extractCsCalls(filePath, content);
-        const aliases = this.extractAliases(filePath, content);
+        // 提取新的别名并合并到现有 aliasLookup
+        const rawAliases = this.extractRawAliases(filePath, content);
+        for (const raw of rawAliases) {
+            if (raw.value.startsWith('CS.')) {
+                this.aliasLookup.set(raw.name, raw.value);
+            } else {
+                const firstDot = raw.value.indexOf('.');
+                const firstPart = firstDot > 0 ? raw.value.substring(0, firstDot) : raw.value;
+                const rest = firstDot > 0 ? raw.value.substring(firstDot) : '';
+                const resolved = this.aliasLookup.get(firstPart);
+                if (resolved) {
+                    this.aliasLookup.set(raw.name, resolved + rest);
+                }
+            }
+        }
 
-        await this.enrichCallerInfo(calls);
+        const calls = [
+            ...this.extractCsCalls(filePath, content),
+            ...this.extractAliasCalls(filePath, content, this.aliasLookup),
+        ];
+        const deduped = this.deduplicateCalls(calls);
+        const aliases = rawAliases
+            .filter(r => this.aliasLookup.has(r.name))
+            .map(r => ({
+                aliasName: r.name,
+                originalPattern: this.aliasLookup.get(r.name)!,
+                file: r.file,
+                line: r.line,
+            }));
 
-        const verifyResults = await this.batchVerifyWithCSharp(calls);
+        await this.enrichCallerInfo(deduped);
+
+        const verifyResults = await this.batchVerifyWithCSharp(deduped);
 
         const transaction = this.cache.db.transaction(() => {
-            for (const call of calls) {
+            for (const call of deduped) {
                 const verified = verifyResults.get(
                     `${call.className}.${call.memberName}`,
                 );
@@ -245,7 +342,7 @@ export class XLuaBridge {
             ORDER BY status ASC
         `).all(`${csharpFqn}%`, `%${csharpFqn}%`) as Record<string, unknown>[];
 
-        // alias 表 fallback：类赋值（C_X = CS.Yoozoo.Manager.X）不会进 xlua_mappings，但会存 lua_aliases
+        // alias 表 fallback：类赋值不会进 xlua_mappings，但会存 lua_aliases
         if (mappings.length === 0) {
             const aliases = this.cache.db.prepare(`
                 SELECT * FROM lua_aliases
@@ -288,6 +385,202 @@ export class XLuaBridge {
                 })),
             },
         };
+    }
+
+    // ===== 别名链解析 =====
+
+    /**
+     * 提取文件中的所有原始赋值（global + local），不做链解析
+     */
+    private extractRawAliases(filePath: string, content: string): RawAlias[] {
+        const aliases: RawAlias[] = [];
+        const seen = new Set<string>(); // 同文件同名去重（取最后一个赋值）
+        let match;
+
+        // global: varName = value.with.dots
+        RAW_GLOBAL_ALIAS.lastIndex = 0;
+        while ((match = RAW_GLOBAL_ALIAS.exec(content)) !== null) {
+            const name = match[1];
+            const value = match[2];
+            // 过滤明显不是别名的赋值
+            if (this.isLikelyAlias(name, value)) {
+                seen.add(name);
+                aliases.push({
+                    name, value,
+                    file: filePath,
+                    line: this.getLineNumber(content, match.index),
+                });
+            }
+        }
+
+        // local: local varName = value.with.dots
+        RAW_LOCAL_ALIAS.lastIndex = 0;
+        while ((match = RAW_LOCAL_ALIAS.exec(content)) !== null) {
+            const name = match[1];
+            const value = match[2];
+            if (this.isLikelyAlias(name, value) && !seen.has(name)) {
+                aliases.push({
+                    name, value,
+                    file: filePath,
+                    line: this.getLineNumber(content, match.index),
+                });
+            }
+        }
+
+        return aliases;
+    }
+
+    /**
+     * 启发式判断赋值是否可能是 C# 别名：
+     * - 值以 CS. 开头：肯定是
+     * - 值首段首字母大写且包含至少一个点：很可能是
+     * - 变量名以 C_/D_/E_/G_ 开头：XLua 项目约定
+     */
+    private isLikelyAlias(name: string, value: string): boolean {
+        if (value.startsWith('CS.')) return true;
+        // 必须包含至少一个点（排除 x = nil/true/someVar）
+        if (!value.includes('.')) return false;
+        const firstPart = value.split('.')[0];
+        // 首段首字母大写（C# 命名空间约定）
+        if (/^[A-Z]/.test(firstPart)) return true;
+        // 变量名以常见 XLua 前缀开头
+        if (/^[CDE]_/.test(name)) return true;
+        return false;
+    }
+
+    /**
+     * 迭代解析别名链：
+     * 1. 直接 CS. 前缀的别名立即解析
+     * 2. 非 CS. 前缀的别名，检查值首段是否已解析，若是则替换并解析
+     * 3. 重复直到不再有新解析
+     */
+    private resolveAliasChains(rawAliases: RawAlias[]): Map<string, string> {
+        const resolved = new Map<string, string>();
+        let pending = rawAliases.slice();
+
+        // Pass 0: 直接 CS. 前缀
+        const stillPending: RawAlias[] = [];
+        for (const alias of pending) {
+            if (alias.value.startsWith('CS.')) {
+                resolved.set(alias.name, alias.value);
+            } else {
+                stillPending.push(alias);
+            }
+        }
+        pending = stillPending;
+
+        // 迭代解析链（最多 10 轮防止循环引用）
+        for (let round = 0; round < 10 && pending.length > 0; round++) {
+            let changed = false;
+            const nextPending: RawAlias[] = [];
+
+            for (const alias of pending) {
+                const firstDot = alias.value.indexOf('.');
+                const firstPart = firstDot > 0 ? alias.value.substring(0, firstDot) : alias.value;
+                const rest = firstDot > 0 ? alias.value.substring(firstDot) : '';
+
+                if (resolved.has(firstPart)) {
+                    const resolvedPrefix = resolved.get(firstPart)!;
+                    resolved.set(alias.name, resolvedPrefix + rest);
+                    changed = true;
+                } else {
+                    nextPending.push(alias);
+                }
+            }
+
+            pending = nextPending;
+            if (!changed) break;
+        }
+
+        return resolved;
+    }
+
+    // ===== 调用提取 =====
+
+    /** 提取直接 CS. 调用 */
+    private extractCsCalls(filePath: string, content: string): XLuaCall[] {
+        const calls: XLuaCall[] = [];
+        let match;
+        CS_CALL_PATTERN.lastIndex = 0;
+
+        while ((match = CS_CALL_PATTERN.exec(content)) !== null) {
+            const line = this.getLineNumber(content, match.index);
+            const className = match[1];
+            const memberName = match[2];
+            const separator = match[0].includes(':') ? ':' : '.';
+
+            calls.push({
+                pattern: `CS.${className}${separator}${memberName}`,
+                className, memberName, file: filePath, line,
+            });
+        }
+        return calls;
+    }
+
+    /**
+     * 通过别名表提取间接调用：
+     * 对每个 identifier:method() 或 identifier.method()，
+     * 如果 identifier 在 aliasLookup 中，记录为 C# 跨语言调用。
+     * 跳过 UnityEngine/System 等引擎 API 别名（数千个 Vector3.new() 没有跟踪价值）
+     */
+    private extractAliasCalls(
+        filePath: string, content: string,
+        aliasLookup: Map<string, string>,
+    ): XLuaCall[] {
+        const calls: XLuaCall[] = [];
+        let match;
+        ALIAS_CALL_PATTERN.lastIndex = 0;
+
+        while ((match = ALIAS_CALL_PATTERN.exec(content)) !== null) {
+            const varName = match[1];
+            const methodName = match[2];
+
+            // 跳过直接 CS. 调用（已被 extractCsCalls 处理）
+            const prefixStart = Math.max(0, match.index - 3);
+            const prefix = content.substring(prefixStart, match.index);
+            if (prefix.endsWith('CS.')) continue;
+
+            const resolvedFqn = aliasLookup.get(varName);
+            if (!resolvedFqn) continue;
+
+            // 跳过引擎/框架 API 别名（只跟踪项目自有类）
+            const className = resolvedFqn.replace(/^CS\./, '');
+            if (this.isBuiltinNamespace(className)) continue;
+
+            const line = this.getLineNumber(content, match.index);
+            const separator = match[0].includes(':') ? ':' : '.';
+
+            calls.push({
+                pattern: `${varName}${separator}${methodName}`,
+                className,
+                memberName: methodName,
+                file: filePath,
+                line,
+            });
+        }
+
+        return calls;
+    }
+
+    /** 判断是否引擎/框架命名空间（不需要跟踪跨语言调用） */
+    private isBuiltinNamespace(className: string): boolean {
+        const topNs = className.split('.')[0];
+        return UNITY_NS.includes(topNs) || DOTNET_NS.includes(topNs) ||
+            this.thirdPartyNs.includes(topNs);
+    }
+
+    /** 按 file:line:className.memberName 去重 */
+    private deduplicateCalls(calls: XLuaCall[]): XLuaCall[] {
+        const seen = new Set<string>();
+        const result: XLuaCall[] = [];
+        for (const call of calls) {
+            const key = `${call.file}:${call.line}:${call.className}.${call.memberName}`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                result.push(call);
+            }
+        }
+        return result;
     }
 
     // ===== 批量验证 =====
@@ -398,55 +691,7 @@ export class XLuaBridge {
         return null;
     }
 
-    // ===== 内部方法 =====
-
-    private extractCsCalls(filePath: string, content: string): XLuaCall[] {
-        const calls: XLuaCall[] = [];
-        let match;
-        CS_CALL_PATTERN.lastIndex = 0;
-
-        while ((match = CS_CALL_PATTERN.exec(content)) !== null) {
-            const line = this.getLineNumber(content, match.index);
-            const className = match[1];
-            const memberName = match[2];
-            const separator = match[0].includes(':') ? ':' : '.';
-
-            calls.push({
-                pattern: `CS.${className}${separator}${memberName}`,
-                className, memberName, file: filePath, line,
-            });
-        }
-        return calls;
-    }
-
-    private extractAliases(filePath: string, content: string): XLuaAlias[] {
-        const aliases: XLuaAlias[] = [];
-        let match;
-
-        // local aliases: local xxx = CS.yyy
-        CS_ALIAS_PATTERN.lastIndex = 0;
-        while ((match = CS_ALIAS_PATTERN.exec(content)) !== null) {
-            aliases.push({
-                aliasName: match[1],
-                originalPattern: `CS.${match[2]}`,
-                file: filePath,
-                line: this.getLineNumber(content, match.index),
-            });
-        }
-
-        // global aliases: C_xxx = CS.yyy (common XLua pattern in alias.lua)
-        CS_GLOBAL_ALIAS_PATTERN.lastIndex = 0;
-        while ((match = CS_GLOBAL_ALIAS_PATTERN.exec(content)) !== null) {
-            aliases.push({
-                aliasName: match[1],
-                originalPattern: `CS.${match[2]}`,
-                file: filePath,
-                line: this.getLineNumber(content, match.index),
-            });
-        }
-
-        return aliases;
-    }
+    // ===== 辅助方法 =====
 
     private async enrichCallerInfo(calls: XLuaCall[]): Promise<void> {
         const luaLs = this.lspManager.getClientForLanguage('lua');
@@ -458,16 +703,21 @@ export class XLuaBridge {
             byFile.get(call.file)!.push(call);
         }
 
-        for (const [file, fileCalls] of byFile) {
-            try {
-                const uri = relativeToUri(this.luaRoot, file);
-                const symbols = await luaLs.documentSymbol(uri);
-                for (const call of fileCalls) {
-                    call.callerFqn = this.findEnclosingSymbol(
-                        symbols as import('vscode-languageserver-protocol').DocumentSymbol[], call.line,
-                    );
-                }
-            } catch { /* don't block */ }
+        const files = [...byFile.entries()];
+        const CONCURRENCY = 8;
+        for (let i = 0; i < files.length; i += CONCURRENCY) {
+            const batch = files.slice(i, i + CONCURRENCY);
+            await Promise.allSettled(
+                batch.map(async ([file, fileCalls]) => {
+                    const uri = relativeToUri(this.luaRoot, file);
+                    const symbols = await luaLs.documentSymbol(uri);
+                    for (const call of fileCalls) {
+                        call.callerFqn = this.findEnclosingSymbol(
+                            symbols as import('vscode-languageserver-protocol').DocumentSymbol[], call.line,
+                        );
+                    }
+                }),
+            );
         }
     }
 

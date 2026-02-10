@@ -90,7 +90,7 @@ export async function startMcpServer(options: CsgServerOptions): Promise<void> {
         if (options.luaRoot) {
             try {
                 const scanResult = await xluaBridge.fullScan();
-                console.error(`[CSG] XLua scan: ${scanResult.totalCalls} calls, ${scanResult.verified} verified, ${scanResult.unresolved} unresolved (${scanResult.duration}ms)`);
+                console.error(`[CSG] XLua scan: ${scanResult.totalCalls} calls (${scanResult.aliasCallsFound} via alias), ${scanResult.verified} verified, ${scanResult.aliases} aliases (${scanResult.duration}ms)`);
             } catch (err) {
                 console.error(`[CSG] XLua scan failed: ${err}`);
             }

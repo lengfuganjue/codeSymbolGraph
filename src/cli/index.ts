@@ -478,7 +478,7 @@ program
             try {
                 console.log('Running XLua scan...');
                 const scanResult = await xluaBridge.fullScan();
-                console.log(`XLua scan: ${scanResult.totalCalls} calls, ${scanResult.verified} verified, ${scanResult.unresolved} unresolved (${scanResult.duration}ms)`);
+                console.log(`XLua scan: ${scanResult.totalCalls} calls (${scanResult.aliasCallsFound} via alias), ${scanResult.verified} verified, ${scanResult.aliases} aliases, ${scanResult.unresolved} unresolved (${scanResult.duration}ms)`);
             } catch (err) {
                 console.error(`XLua scan failed: ${err}`);
             }
@@ -692,7 +692,7 @@ program
                 adv.extraThirdPartyNamespaces,
             );
             const scanResult = await xluaBridge.fullScan();
-            console.log(`XLua scan: ${scanResult.totalCalls} calls, ${scanResult.verified} verified, ${scanResult.unresolved} unresolved (${scanResult.duration}ms)`);
+            console.log(`XLua scan: ${scanResult.totalCalls} calls (${scanResult.aliasCallsFound} via alias), ${scanResult.verified} verified, ${scanResult.aliases} aliases, ${scanResult.unresolved} unresolved (${scanResult.duration}ms)`);
         }
 
         const stats = cache.getStats();

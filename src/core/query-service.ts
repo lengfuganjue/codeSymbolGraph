@@ -463,7 +463,7 @@ export class QueryService {
         if (file.endsWith('.cs') && fqn) {
             const symbolName = fqn.includes('.') ? fqn.split('.').pop()! : fqn;
             const nonGenResults = results.filter(r => !isGeneratedCode(r.file));
-            if (nonGenResults.length < 10) {
+            if (nonGenResults.length < 100) {
                 const grepResults = await this.grepCsharpReferences(symbolName);
                 if (grepResults.length > 0) {
                     // 按 file:line 去重合并
@@ -484,8 +484,8 @@ export class QueryService {
             }
         }
 
-        // 写缓存（仅在有结果时缓存，避免缓存空结果阻塞后续查询）
-        if (results.length > 0) {
+        // 写缓存：有结果 + LSP 未超时才缓存（超时走 grep 的低质量结果不缓存，下次重试 LSP）
+        if (results.length > 0 && !lspTimedOut) {
             this.cache.cacheReferences(
                 fqn,
                 { file, line: line - 1, char: character },
