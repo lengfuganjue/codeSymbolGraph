@@ -4,6 +4,27 @@ import { relativeToUri, uriToRelative } from '../utils/uri.js';
 import { LspTimeoutError } from '../utils/timeout.js';
 import type { Location, DocumentSymbol, SymbolInformation } from 'vscode-languageserver-protocol';
 import { glob } from 'glob';
+import * as fs from 'fs/promises';
+import * as path from 'path';
+
+/** 检测是否是 XLua/代码生成器输出的文件（不应作为定义结果优先返回） */
+export function isGeneratedCode(filePath: string): boolean {
+    const normalized = filePath.replace(/\\/g, '/');
+    return /\bXLua\/Gen\b/i.test(normalized)
+        || /\bCSObjectWrap\b/i.test(normalized)
+        || /Wrap\.cs$/i.test(normalized);
+}
+
+/**
+ * 对定义结果排序：源码优先，生成代码靠后。
+ * 同等条件下 Packages/ 和 Assets/ 优先于其他路径。
+ */
+function definitionPriority(filePath: string): number {
+    if (isGeneratedCode(filePath)) return 100;
+    const normalized = filePath.replace(/\\/g, '/');
+    if (normalized.includes('Packages/') || normalized.includes('Assets/')) return 0;
+    return 50;
+}
 
 /** normalizeDocSymbols 的返回类型 */
 interface NormalizedSymbols {
@@ -109,17 +130,21 @@ export class QueryService {
 
         console.error(`[CSG] resolveViaLsp("${name}"): exact=${exactResults.length} fuzzy=${fuzzyResults.length}`);
 
+        // 排序：源码优先，生成代码靠后
+        const sortByPriority = (arr: ResolvedSymbol[]) =>
+            arr.sort((a, b) => definitionPriority(a.file) - definitionPriority(b.file));
+
         // 精确匹配有结果就用精确的
-        let results = exactResults.length > 0 ? exactResults : [];
+        let results = exactResults.length > 0 ? sortByPriority(exactResults) : [];
 
         // dotted name 没有精确匹配时，优先用 container+documentSymbol（比 fuzzy 精确）
         if (results.length === 0 && name.includes('.')) {
             results = await this.resolveMethodViaContainer(name);
         }
 
-        // 最后才用 fuzzy
+        // 最后才用 fuzzy（也按优先级排序，源码优先于生成代码）
         if (results.length === 0) {
-            results = fuzzyResults;
+            results = sortByPriority(fuzzyResults);
         }
 
         // Lua 模块按文件名兜底（local 变量不在 workspace/symbol 索引中）
@@ -299,6 +324,9 @@ export class QueryService {
         if (query.name) {
             const resolved = await this.resolveSymbol(query.name, query.kind);
 
+            // 源码优先，生成代码靠后
+            resolved.sort((a, b) => definitionPriority(a.file) - definitionPriority(b.file));
+
             const enriched = await Promise.all(
                 resolved.map(r => this.enrichWithHover(r)),
             );
@@ -324,17 +352,19 @@ export class QueryService {
             }
 
             const locations = Array.isArray(result) ? result : [result];
-            return locations.map((loc: Location) => ({
-                name: '',
-                fqn: '',
-                kind: 0,
-                language: query.file!.endsWith('.cs') ? 'csharp' : 'lua',
-                file: uriToRelative(this.workspaceRoot, loc.uri),
-                line: loc.range.start.line + 1,
-                character: loc.range.start.character,
-                source: 'lsp' as const,
-                latencyMs: Date.now() - startTime,
-            }));
+            return locations
+                .map((loc: Location) => ({
+                    name: '',
+                    fqn: '',
+                    kind: 0,
+                    language: query.file!.endsWith('.cs') ? 'csharp' : 'lua',
+                    file: uriToRelative(this.workspaceRoot, loc.uri),
+                    line: loc.range.start.line + 1,
+                    character: loc.range.start.character,
+                    source: 'lsp' as const,
+                    latencyMs: Date.now() - startTime,
+                }))
+                .sort((a, b) => definitionPriority(a.file) - definitionPriority(b.file));
         }
 
         return [];
@@ -359,6 +389,11 @@ export class QueryService {
         if (!file && query.name) {
             const resolved = await this.resolveSymbol(query.name);
             if (resolved.length === 0) {
+                // Lua 全局变量 fallback：grep 找到一个位置 → LuaLS 做语义追踪 → grep 兜底
+                const lspResult = await this.resolveViaGrepThenLsp(query.name);
+                if (lspResult) {
+                    return lspResult;
+                }
                 return { symbolFqn: fqn, references: [], count: 0, source: 'lsp' };
             }
             const first = resolved[0];
@@ -387,24 +422,70 @@ export class QueryService {
             };
         }
 
-        // LSP
+        // LSP references（超时视为 0 结果，让 grep fallback 兜底）
+        let lspRefs: Location[] = [];
+        let lspTimedOut = false;
         try {
             const client = this.lspManager.getClientForFile(file);
             const uri = relativeToUri(this.workspaceRoot, file);
             console.error(`[CSG] references: uri=${uri} pos=${line - 1}:${character} fqn=${fqn}`);
 
-            const lspRefs = await client.references(
+            lspRefs = await client.references(
                 uri, line - 1, character, false,
             );
             console.error(`[CSG] references: ${lspRefs.length} results`);
+        } catch (e) {
+            if (e instanceof LspTimeoutError) {
+                console.error(`[CSG] references: LSP timeout for ${file}:${line}, will try grep fallback`);
+                lspTimedOut = true;
+            } else {
+                throw e;
+            }
+        }
 
-            const results = lspRefs.map(ref => ({
-                file: uriToRelative(this.workspaceRoot, ref.uri),
-                line: ref.range.start.line + 1,
-                character: ref.range.start.character,
-            }));
+        let results = lspRefs.map(ref => ({
+            file: uriToRelative(this.workspaceRoot, ref.uri),
+            line: ref.range.start.line + 1,
+            character: ref.range.start.character,
+        }));
 
-            // 写缓存
+        // Lua grep fallback：LuaLS 对全局变量/workspace 外文件 references 常返回空或超时
+        if (results.length === 0 && file.endsWith('.lua') && fqn) {
+            const symbolName = fqn.includes('.') ? fqn.split('.').pop()! : fqn;
+            const grepResults = await this.grepLuaReferences(symbolName);
+            if (grepResults.length > 0) {
+                console.error(`[CSG] references: Lua grep fallback found ${grepResults.length} results for "${symbolName}"`);
+                results = grepResults;
+            }
+        }
+
+        // C# grep 补充：csharp-ls references 常遗漏非生成代码文件的引用
+        if (file.endsWith('.cs') && fqn) {
+            const symbolName = fqn.includes('.') ? fqn.split('.').pop()! : fqn;
+            const nonGenResults = results.filter(r => !isGeneratedCode(r.file));
+            if (nonGenResults.length < 10) {
+                const grepResults = await this.grepCsharpReferences(symbolName);
+                if (grepResults.length > 0) {
+                    // 按 file:line 去重合并
+                    const seen = new Set(results.map(r => `${r.file}:${r.line}`));
+                    let added = 0;
+                    for (const gr of grepResults) {
+                        const key = `${gr.file}:${gr.line}`;
+                        if (!seen.has(key)) {
+                            results.push(gr);
+                            seen.add(key);
+                            added++;
+                        }
+                    }
+                    if (added > 0) {
+                        console.error(`[CSG] references: C# grep added ${added} results for "${symbolName}"`);
+                    }
+                }
+            }
+        }
+
+        // 写缓存（仅在有结果时缓存，避免缓存空结果阻塞后续查询）
+        if (results.length > 0) {
             this.cache.cacheReferences(
                 fqn,
                 { file, line: line - 1, char: character },
@@ -415,25 +496,14 @@ export class QueryService {
                     cached_at: Date.now(),
                 })),
             );
-
-            return {
-                symbolFqn: fqn,
-                references: results,
-                count: results.length,
-                source: 'lsp',
-            };
-        } catch (e) {
-            if (e instanceof LspTimeoutError) {
-                return {
-                    symbolFqn: fqn,
-                    references: [],
-                    count: 0,
-                    source: 'lsp',
-                    error: 'LSP_TIMEOUT',
-                };
-            }
-            throw e;
         }
+
+        return {
+            symbolFqn: fqn,
+            references: results,
+            count: results.length,
+            source: lspTimedOut && results.length > 0 ? 'grep' as const : 'lsp' as const,
+        };
     }
 
     // ===== 调用链查询（基于 references + documentSymbol / callHierarchy） =====
@@ -460,9 +530,11 @@ export class QueryService {
                 return { root: rootFqn, incoming: [], outgoing: [] };
             }
             console.error(`[CSG] findCallChain: resolveSymbol("${query.name}") returned ${resolved.length} results: ${resolved.map(r => `${r.fqn}(kind=${r.kind})`).join(', ')}`);
-            // call_chain 优先选 method/function 级别符号（kind=6/9/12），class 级做 references 通常找不到外层函数
+            // call_chain 优先选非生成代码的 method/function（kind=6/9/12）
             const methodKinds = new Set([6, 9, 12]); // Method, Constructor, Function
-            const preferred = resolved.find(r => methodKinds.has(r.kind)) || resolved[0];
+            const preferred = resolved.find(r => methodKinds.has(r.kind) && !isGeneratedCode(r.file))
+                || resolved.find(r => methodKinds.has(r.kind))
+                || resolved[0];
             file = preferred.file;
             line = preferred.line + 1;
             character = preferred.character;
@@ -489,25 +561,48 @@ export class QueryService {
             console.error(`[CSG] findCallChain: root=${rootFqn} file=${file} line=${line} supportsCallHierarchy=${useCallHierarchy}`);
 
             if (useCallHierarchy) {
+                let chResults: CallChainNode[] = [];
                 try {
-                    result.incoming = await this.findIncomingCallersViaCallHierarchy(
+                    chResults = await this.findIncomingCallersViaCallHierarchy(
                         file, line, character, maxDepth, 0, new Set(),
                     );
-                    console.error(`[CSG] callHierarchy returned ${result.incoming.length} callers`);
+                    console.error(`[CSG] callHierarchy returned ${chResults.length} callers`);
                 } catch (e) {
                     console.error(`[CSG] callHierarchy threw: ${(e as Error).message}`);
                 }
-                // callHierarchy 失败或返回空时，fallback 到 references 路径
-                if (result.incoming.length === 0) {
-                    console.error(`[CSG] callHierarchy empty, falling back to references`);
-                    result.incoming = await this.findIncomingCallers(
+
+                // 始终也走 references 路径，合并两者结果（callHierarchy 常遗漏）
+                let refResults: CallChainNode[] = [];
+                try {
+                    refResults = await this.findIncomingCallers(
                         file, line, character, maxDepth, 0, new Set(),
                     );
+                    console.error(`[CSG] references path returned ${refResults.length} callers`);
+                } catch (e) {
+                    console.error(`[CSG] references path threw: ${(e as Error).message}`);
                 }
+
+                result.incoming = this.mergeCallChainNodes(chResults, refResults);
+                console.error(`[CSG] merged: ${result.incoming.length} unique callers`);
             } else {
                 result.incoming = await this.findIncomingCallers(
                     file, line, character, maxDepth, 0, new Set(),
                 );
+            }
+
+            // C# grep fallback：当 LSP 结果（过滤生成代码后）不足时，用 grep 搜索调用点
+            const nonGenerated = result.incoming.filter(n => !isGeneratedCode(n.file));
+            if (nonGenerated.length === 0 && file.endsWith('.cs')) {
+                // 优先使用原始查询名（用户输入），回退到从 fqn 提取
+                const methodName = query.name || this.extractMethodName(rootFqn);
+                if (methodName) {
+                    console.error(`[CSG] findCallChain: LSP returned no non-generated callers, trying grep for "${methodName}"`);
+                    const grepCallers = await this.grepCsharpCallers(methodName, file);
+                    if (grepCallers.length > 0) {
+                        console.error(`[CSG] findCallChain: grep found ${grepCallers.length} callers`);
+                        result.incoming = this.mergeCallChainNodes(result.incoming, grepCallers);
+                    }
+                }
             }
         }
 
@@ -739,6 +834,24 @@ export class QueryService {
         return undefined;
     }
 
+    /** 合并两组 CallChainNode，按 file:line 去重 */
+    private mergeCallChainNodes(a: CallChainNode[], b: CallChainNode[]): CallChainNode[] {
+        const seen = new Map<string, CallChainNode>();
+        for (const node of [...a, ...b]) {
+            const key = `${node.file}:${node.line}`;
+            if (!seen.has(key)) {
+                seen.set(key, node);
+            } else {
+                // 保留 children 更多的那个
+                const existing = seen.get(key)!;
+                if (node.children.length > existing.children.length) {
+                    seen.set(key, node);
+                }
+            }
+        }
+        return Array.from(seen.values());
+    }
+
     /**
      * 将 SymbolInformation[]（flat）转成 DocumentSymbol[] 格式
      * SymbolInformation 有 location 但没有 range/children
@@ -785,6 +898,260 @@ export class QueryService {
             character: cached.range_start_char,
             stale: cached.stale === 1,
         };
+    }
+
+    /**
+     * Lua 全局变量 fallback：grep 找到一个使用位置 → didOpen → LuaLS references。
+     * 如果 LuaLS 也失败，退化为 grep 结果。
+     */
+    private async resolveViaGrepThenLsp(symbolName: string): Promise<ReferenceResult | null> {
+        // 1. grep 找到第一个使用位置
+        const grepResults = await this.grepLuaReferences(symbolName);
+        if (grepResults.length === 0) return null;
+
+        const firstHit = grepResults[0];
+
+        // 2. 尝试通过 LuaLS references 做语义追踪
+        try {
+            const client = this.lspManager.getClientForLanguage('lua');
+            if (client.state === 'ready') {
+                const absPath = path.join(this.workspaceRoot, firstHit.file);
+                const content = await fs.readFile(absPath, 'utf-8');
+                const uri = relativeToUri(this.workspaceRoot, firstHit.file);
+
+                await client.didOpen(uri, 'lua', content);
+                const lspRefs = await client.references(
+                    uri, firstHit.line - 1, firstHit.character, false,
+                );
+
+                if (lspRefs.length > 0) {
+                    console.error(`[CSG] references: Lua global resolved via grep+LSP: ${lspRefs.length} results for "${symbolName}"`);
+                    return {
+                        symbolFqn: symbolName,
+                        references: lspRefs.map(ref => ({
+                            file: uriToRelative(this.workspaceRoot, ref.uri),
+                            line: ref.range.start.line + 1,
+                            character: ref.range.start.character,
+                        })),
+                        count: lspRefs.length,
+                        source: 'lsp',
+                    };
+                }
+            }
+        } catch (e) {
+            console.error(`[CSG] references: Lua LSP fallback failed: ${(e as Error).message}`);
+        }
+
+        // 3. LuaLS 也失败，退化为 grep 结果
+        console.error(`[CSG] references: grep fallback for "${symbolName}": ${grepResults.length} results`);
+        return {
+            symbolFqn: symbolName,
+            references: grepResults,
+            count: grepResults.length,
+            source: 'grep',
+        };
+    }
+
+    /**
+     * 从 csharp-ls 的 fqn 格式（如 "void GTAGameStart.UMTAwake()"）中提取短方法名
+     */
+    private extractMethodName(fqn: string): string | null {
+        // csharp-ls 格式: "ReturnType Container.Method(params)"
+        const match = fqn.match(/\.(\w+)\s*\(/);
+        if (match) return match[1];
+        // 简单名: "MethodName"
+        const simple = fqn.match(/^(\w+)$/);
+        if (simple) return simple[1];
+        return null;
+    }
+
+    /**
+     * grep C# 文件找到方法调用点，返回 CallChainNode（enclosing function 级）。
+     * 用于 csharp-ls callHierarchy/references 返回空时的 fallback。
+     */
+    private async grepCsharpCallers(
+        methodName: string, sourceFile: string,
+    ): Promise<CallChainNode[]> {
+        // 搜索 .MethodName( 或 this.MethodName( 等调用模式
+        const callPattern = new RegExp(`\\b${methodName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(`, 'g');
+
+        try {
+            const csFiles = await glob('**/*.cs', {
+                cwd: this.workspaceRoot,
+                absolute: false,
+                ignore: ['**/node_modules/**', '**/Library/**', '**/Temp/**'],
+            });
+
+            const callSites: { file: string; line: number }[] = [];
+
+            for (const file of csFiles) {
+                // 跳过生成代码
+                if (isGeneratedCode(file)) continue;
+
+                const absPath = path.join(this.workspaceRoot, file);
+                let content: string;
+                try {
+                    content = await fs.readFile(absPath, 'utf-8');
+                } catch { continue; }
+
+                const lines = content.split('\n');
+                for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i];
+                    // 跳过定义行（方法签名、override/virtual 声明等）
+                    if (/\b(virtual|override|abstract|new)\b/.test(line) && line.includes(methodName)) continue;
+                    // 跳过注释行
+                    const trimmed = line.trimStart();
+                    if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) continue;
+
+                    callPattern.lastIndex = 0;
+                    if (callPattern.test(line)) {
+                        callSites.push({
+                            file: file.replace(/\\/g, '/'),
+                            line: i, // 0-based
+                        });
+                    }
+                }
+
+                if (callSites.length >= 100) break;
+            }
+
+            if (callSites.length === 0) return [];
+
+            // 按文件分组，用 documentSymbol 找 enclosing function
+            const byFile = new Map<string, number[]>();
+            for (const site of callSites) {
+                if (!byFile.has(site.file)) byFile.set(site.file, []);
+                byFile.get(site.file)!.push(site.line);
+            }
+
+            const callerMap = new Map<string, CallChainNode>();
+            for (const [refFile, lines] of byFile) {
+                let docSymbols: (SymbolInformation | DocumentSymbol)[] = [];
+                try {
+                    const client = this.lspManager.getClientForFile(refFile);
+                    const uri = relativeToUri(this.workspaceRoot, refFile);
+                    docSymbols = await client.documentSymbol(uri);
+                } catch { continue; }
+
+                const { symbols: normalized, isFlat } = this.normalizeDocSymbols(docSymbols);
+
+                for (const refLine of lines) {
+                    const enclosing = this.findEnclosingFunction(normalized, refLine, isFlat);
+                    if (enclosing) {
+                        const key = `${refFile}:${enclosing.range.start.line}`;
+                        if (!callerMap.has(key)) {
+                            callerMap.set(key, {
+                                name: enclosing.name,
+                                fqn: enclosing.name,
+                                kind: enclosing.kind,
+                                file: refFile,
+                                line: enclosing.range.start.line + 1,
+                                children: [],
+                            });
+                        }
+                    }
+                }
+            }
+
+            return Array.from(callerMap.values());
+        } catch (e) {
+            console.error(`[CSG] grepCsharpCallers error: ${(e as Error).message}`);
+            return [];
+        }
+    }
+
+    /**
+     * grep C# 文件查找符号引用（csharp-ls references 遗漏 fallback）。
+     * 只搜索非生成代码文件。
+     */
+    private async grepCsharpReferences(
+        symbolName: string,
+    ): Promise<{ file: string; line: number; character: number }[]> {
+        const results: { file: string; line: number; character: number }[] = [];
+        const pattern = new RegExp(`\\b${symbolName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g');
+
+        try {
+            const csFiles = await glob('**/*.cs', {
+                cwd: this.workspaceRoot,
+                absolute: false,
+                ignore: ['**/node_modules/**', '**/Library/**', '**/Temp/**'],
+            });
+
+            for (const file of csFiles) {
+                if (isGeneratedCode(file)) continue;
+
+                const absPath = path.join(this.workspaceRoot, file);
+                let content: string;
+                try {
+                    content = await fs.readFile(absPath, 'utf-8');
+                } catch { continue; }
+
+                const lines = content.split('\n');
+                for (let i = 0; i < lines.length; i++) {
+                    pattern.lastIndex = 0;
+                    const match = pattern.exec(lines[i]);
+                    if (match) {
+                        results.push({
+                            file: file.replace(/\\/g, '/'),
+                            line: i + 1,
+                            character: match.index,
+                        });
+                    }
+                }
+
+                if (results.length >= 500) break;
+            }
+        } catch (e) {
+            console.error(`[CSG] grepCsharpReferences error: ${(e as Error).message}`);
+        }
+
+        return results;
+    }
+
+    /**
+     * 正则扫描所有 Lua 文件查找符号引用（LuaLS 全局变量 fallback）。
+     * 仅在 LuaLS references 返回空时调用。
+     */
+    private async grepLuaReferences(
+        symbolName: string,
+    ): Promise<{ file: string; line: number; character: number }[]> {
+        const results: { file: string; line: number; character: number }[] = [];
+        const pattern = new RegExp(`\\b${symbolName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g');
+
+        try {
+            const luaFiles = await glob('**/*.lua', {
+                cwd: this.workspaceRoot,
+                absolute: false,
+                ignore: ['**/node_modules/**', '**/Library/**', '**/Temp/**'],
+            });
+
+            for (const file of luaFiles) {
+                const absPath = path.join(this.workspaceRoot, file);
+                let content: string;
+                try {
+                    content = await fs.readFile(absPath, 'utf-8');
+                } catch { continue; }
+
+                const lines = content.split('\n');
+                for (let i = 0; i < lines.length; i++) {
+                    pattern.lastIndex = 0;
+                    const match = pattern.exec(lines[i]);
+                    if (match) {
+                        results.push({
+                            file: file.replace(/\\/g, '/'),
+                            line: i + 1,
+                            character: match.index,
+                        });
+                    }
+                }
+
+                if (results.length >= 500) break; // 安全上限
+            }
+        } catch (e) {
+            console.error(`[CSG] grepLuaReferences error: ${(e as Error).message}`);
+        }
+
+        return results;
     }
 
     private async enrichWithHover(sym: ResolvedSymbol): Promise<ResolvedSymbol> {
@@ -846,7 +1213,7 @@ export interface ResolvedSymbol {
 }
 
 export interface DefinitionResult extends ResolvedSymbol {
-    source: 'cache' | 'lsp' | 'cache_stale';
+    source: 'cache' | 'lsp' | 'cache_stale' | 'grep';
     latencyMs: number;
 }
 
@@ -854,7 +1221,7 @@ export interface ReferenceResult {
     symbolFqn: string;
     references: { file: string; line: number; character: number }[];
     count: number;
-    source: 'cache' | 'lsp';
+    source: 'cache' | 'lsp' | 'grep';
     error?: string;
 }
 

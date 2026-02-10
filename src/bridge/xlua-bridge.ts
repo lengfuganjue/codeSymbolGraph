@@ -9,7 +9,7 @@ import type { SymbolInformation } from 'vscode-languageserver-protocol';
 
 const CS_CALL_PATTERN = /CS\.([\w.]+)[:\.](\w+)\s*\(/g;
 const CS_ALIAS_PATTERN = /local\s+(\w+)\s*=\s*CS\.([\w.]+)\s*$/gm;
-const CS_GLOBAL_ALIAS_PATTERN = /^(\w+)\s*=\s*CS\.([\w.]+)\s*$/gm;
+const CS_GLOBAL_ALIAS_PATTERN = /^\s*(\w+)\s*=\s*CS\.([\w.]+)\s*$/gm;
 
 interface XLuaCall {
     pattern: string;
@@ -239,13 +239,36 @@ export class XLuaBridge {
             csharpFqn = name;
         }
 
-        const mappings = this.cache.db.prepare(`
+        let mappings = this.cache.db.prepare(`
             SELECT * FROM xlua_mappings
             WHERE csharp_fqn LIKE ? OR lua_call_pattern LIKE ?
             ORDER BY status ASC
         `).all(`${csharpFqn}%`, `%${csharpFqn}%`) as Record<string, unknown>[];
 
-        if (mappings.length === 0) return null;
+        // alias 表 fallback：类赋值（C_X = CS.Yoozoo.Manager.X）不会进 xlua_mappings，但会存 lua_aliases
+        if (mappings.length === 0) {
+            const aliases = this.cache.db.prepare(`
+                SELECT * FROM lua_aliases
+                WHERE original_cs_pattern LIKE ? OR alias_name LIKE ?
+            `).all(`%${csharpFqn}%`, `%${csharpFqn}%`) as Record<string, unknown>[];
+
+            if (aliases.length > 0) {
+                return {
+                    csharp: { fqn: csharpFqn },
+                    lua: {
+                        globalName: `CS.${csharpFqn}`,
+                        callSites: aliases.map(a => ({
+                            file: a.alias_file as string,
+                            line: a.alias_line as number,
+                            callerFqn: undefined,
+                            pattern: `${a.alias_name} = ${a.original_cs_pattern}`,
+                            status: 'alias',
+                        })),
+                    },
+                };
+            }
+            return null;
+        }
 
         return {
             csharp: {
@@ -288,17 +311,21 @@ export class XLuaBridge {
             if (!uniquePairs.has(key)) uniquePairs.set(key, call);
         }
 
-        // Query workspaceSymbol for each unique member name (deduplicated)
+        // Query workspaceSymbol for each unique member name (parallel, deduplicated)
+        const uniqueMembers = new Set<string>();
+        for (const [, call] of uniquePairs) uniqueMembers.add(call.memberName);
+
         const queriedMembers = new Map<string, SymbolInformation[]>();
-        for (const [, call] of uniquePairs) {
-            if (!queriedMembers.has(call.memberName)) {
-                try {
-                    const symbols = await csharpClient.workspaceSymbol(call.memberName);
-                    queriedMembers.set(call.memberName, symbols);
-                } catch (e) {
-                    if (e instanceof LspTimeoutError) continue;
-                    queriedMembers.set(call.memberName, []);
-                }
+        const memberList = [...uniqueMembers];
+        const CONCURRENCY = 8;
+        for (let i = 0; i < memberList.length; i += CONCURRENCY) {
+            const batch = memberList.slice(i, i + CONCURRENCY);
+            const results = await Promise.allSettled(
+                batch.map(m => csharpClient.workspaceSymbol(m)),
+            );
+            for (let j = 0; j < batch.length; j++) {
+                const r = results[j];
+                queriedMembers.set(batch[j], r.status === 'fulfilled' ? r.value : []);
             }
         }
 
