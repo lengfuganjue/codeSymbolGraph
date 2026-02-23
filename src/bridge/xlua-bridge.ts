@@ -181,6 +181,19 @@ export class XLuaBridge {
         })();
         console.error(`[CSG] getcomponent: ${allGetComponentFields.length} fields, ${fieldTypeLookup.size} unique`);
 
+        // ===== Phase 1.5b: 短名解析（通过 workspaceSymbol 查找唯一匹配的 FQN）=====
+        await this.resolveGetComponentShortNames(fieldTypeLookup);
+
+        // 将解析后的 FQN 同步到 DB
+        const updateGcf = this.cache.db.prepare(
+            'UPDATE getcomponent_fields SET type_name = ? WHERE field_name = ? AND lua_file = ? AND lua_line = ?',
+        );
+        for (const [, field] of fieldTypeLookup) {
+            if (!field.isShortName) {
+                updateGcf.run(field.typeName, field.fieldName, field.file, field.line);
+            }
+        }
+
         // ===== Phase 2: 解析别名链 =====
         this.aliasLookup = this.resolveAliasChains(rawAliases);
         console.error(`[CSG] alias chain: ${rawAliases.length} raw → ${this.aliasLookup.size} resolved`);
@@ -327,6 +340,9 @@ export class XLuaBridge {
                 fieldTypeLookup.set(f.fieldName, f);
             }
         }
+
+        // 短名解析（增量更新也支持）
+        await this.resolveGetComponentShortNames(fieldTypeLookup);
 
         const calls = [
             ...this.extractCsCalls(filePath, content),
@@ -669,6 +685,99 @@ export class XLuaBridge {
         }
 
         return fields;
+    }
+
+    /**
+     * 对 GetComponent 短名字段，尝试通过 workspaceSymbol 查找唯一匹配的 C# 类型，
+     * 解析出完整 FQN。只有唯一匹配时才确定，多匹配/无匹配/LSP 不可用时跳过。
+     *
+     * 会就地修改 fieldTypeLookup 中对应条目的 typeName 和 isShortName。
+     */
+    async resolveGetComponentShortNames(
+        fieldTypeLookup: Map<string, GetComponentField>,
+    ): Promise<void> {
+        const csharpClient = this.lspManager.getClientForLanguage('csharp');
+        if (csharpClient.state !== 'ready') {
+            console.error('[CSG] resolveGetComponentShortNames: csharp LSP not ready, skipping');
+            return;
+        }
+
+        // 收集所有 isShortName=true 的唯一短名
+        const shortNameFields = new Map<string, GetComponentField[]>();
+        for (const [, field] of fieldTypeLookup) {
+            if (field.isShortName) {
+                if (!shortNameFields.has(field.typeName)) {
+                    shortNameFields.set(field.typeName, []);
+                }
+                shortNameFields.get(field.typeName)!.push(field);
+            }
+        }
+
+        if (shortNameFields.size === 0) return;
+
+        const shortNames = [...shortNameFields.keys()];
+        let resolvedCount = 0;
+
+        // SymbolKind: Class=5, Enum=10, Interface=11, Struct=23
+        const TYPE_KINDS = new Set([5, 10, 11, 23]);
+
+        const CONCURRENCY = 8;
+        for (let i = 0; i < shortNames.length; i += CONCURRENCY) {
+            const batch = shortNames.slice(i, i + CONCURRENCY);
+            const results = await Promise.allSettled(
+                batch.map(name => csharpClient.workspaceSymbol(name)),
+            );
+
+            for (let j = 0; j < batch.length; j++) {
+                const shortName = batch[j];
+                const r = results[j];
+                if (r.status !== 'fulfilled') continue;
+
+                const symbols = r.value;
+
+                // 筛选：只保留类型符号（Class/Struct/Enum/Interface），且名字精确匹配短名
+                const typeMatches = symbols.filter(s => {
+                    if (!TYPE_KINDS.has(s.kind)) return false;
+
+                    // csharp-ls containerName 常为 null，name 可能是 "ClassName" 或
+                    // 带命名空间的格式。我们需要精确匹配短名。
+                    const symName = s.name;
+                    // 精确匹配：name 就是短名
+                    if (symName === shortName) return true;
+                    // csharp-ls 可能返回 "Namespace.ClassName" 格式
+                    if (symName.endsWith(`.${shortName}`)) return true;
+                    return false;
+                });
+
+                if (typeMatches.length === 1) {
+                    // 唯一匹配 → 解析 FQN
+                    const sym = typeMatches[0];
+                    // csharp-ls containerName 通常为 null，name 可能是 "ClassName" 或 "Namespace.ClassName"
+                    const containerNorm = sym.containerName?.replace(/:/g, '.') || '';
+                    let fqn: string;
+                    if (containerNorm) {
+                        fqn = `${containerNorm}.${sym.name}`;
+                    } else if (sym.name.includes('.')) {
+                        // name 自带命名空间（如 "Game.GotoMask"）
+                        fqn = sym.name;
+                    } else {
+                        // 只有短名，无法确定完整 FQN，跳过
+                        continue;
+                    }
+
+                    // 更新 fieldTypeLookup 中所有使用该短名的条目
+                    const fields = shortNameFields.get(shortName)!;
+                    for (const field of fields) {
+                        field.typeName = fqn;
+                        field.isShortName = false;
+                    }
+                    resolvedCount++;
+                }
+                // 多匹配或无匹配 → 跳过
+            }
+        }
+
+        console.error(`[CSG] resolveGetComponentShortNames: resolved ${resolvedCount}/${shortNameFields.size} short names`);
     }
 
     /** 判断是否引擎/框架命名空间（不需要跟踪跨语言调用） */
