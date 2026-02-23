@@ -16,7 +16,7 @@ import { UpdateCoordinator } from '../core/update-coordinator.js';
 import { DaemonHttpServer, DEFAULT_PORT } from '../daemon/http-server.js';
 import { type CsgConfig, type AdvancedConfig, resolveAdvanced } from '../config.js';
 import { setTimeouts } from '../utils/timeout.js';
-import { isUnityOldFormat, convertUnityProject } from '../utils/unity-csproj.js';
+import { isUnityOldFormat, isUnityProject, convertUnityProject } from '../utils/unity-csproj.js';
 import { AssetIndex } from '../core/asset-index.js';
 import { ProtocolIndex } from '../core/protocol-index.js';
 
@@ -174,12 +174,12 @@ program
         // 1. Detect .sln（Unity 项目自动转换旧格式 csproj）
         let slnPath = options.sln;
         if (!slnPath) {
-            // 检测是否是 Unity 项目（有旧格式 Assembly-CSharp.csproj）
+            // 检测是否是 Unity 项目（旧格式或新版 SDK-style 都需要合并）
             const mainCsproj = path.join(process.cwd(), 'Assembly-CSharp.csproj');
             let needsConvert = false;
             try {
                 const content = await fs.readFile(mainCsproj, 'utf-8');
-                needsConvert = isUnityOldFormat(content);
+                needsConvert = isUnityOldFormat(content) || isUnityProject(content);
             } catch { /* file doesn't exist */ }
 
             if (needsConvert) {
@@ -187,7 +187,7 @@ program
                 try {
                     const result = convertUnityProject(process.cwd());
                     slnPath = result.slnPath;
-                    console.log(`[OK] Merged ${result.compileItemCount} .cs files from ${result.sourceProjectCount} projects (skipped ${result.skippedCount} editor/player/test)`);
+                    console.log(`[OK] Merged ${result.compileItemCount} .cs files, ${result.referenceCount} DLL references from ${result.sourceProjectCount} projects (skipped ${result.skippedCount} editor/player/test)`);
                 } catch (e) {
                     console.error(`[!!] Conversion failed: ${(e as Error).message}`);
                     process.exit(1);
@@ -735,6 +735,7 @@ program
             'find-protocol': { endpoint: '/api/find-protocol', method: 'POST' },
             'check-lua': { endpoint: '/api/check-lua', method: 'POST' },
             'check-csharp': { endpoint: '/api/check-csharp', method: 'POST' },
+            'hierarchy': { endpoint: '/api/hierarchy', method: 'POST' },
         };
 
         const mapping = toolMap[tool];
@@ -751,6 +752,7 @@ program
                 // 检查是否是 key=value 格式
                 const hasKeyValue = queryArgs.some(a => a.includes('='));
                 if (hasKeyValue) {
+                    const firstArgKey = (tool === 'check-lua' || tool === 'check-csharp') ? 'file' : 'name';
                     for (const arg of queryArgs) {
                         const eqIdx = arg.indexOf('=');
                         if (eqIdx > 0) {
@@ -761,6 +763,9 @@ program
                             else if (val === 'false') body[key] = false;
                             else if (/^\d+$/.test(val)) body[key] = parseInt(val, 10);
                             else body[key] = val;
+                        } else if (!body[firstArgKey]) {
+                            // 不含 = 的参数作为第一个位置参数
+                            body[firstArgKey] = arg;
                         }
                     }
                 } else {
@@ -929,6 +934,28 @@ function formatQueryResult(tool: string, result: unknown): void {
                 console.log(`\n(${data.filteredUnityNoise} Unity assembly noise error(s) filtered)`);
             }
             console.log(`\nTotal: ${data?.total || 0} diagnostic(s)`);
+            break;
+        }
+
+        case 'hierarchy': {
+            const target = data?.target;
+            if (target) {
+                console.log(`Target: ${target.fqn} (${target.kind === 5 ? 'class' : target.kind === 11 ? 'interface' : 'type'})`);
+                if (target.file) console.log(`  ${target.file}:${target.line}`);
+            }
+            const bases = data?.baseTypes || [];
+            if (bases.length > 0) {
+                console.log(`\nBase types: ${bases.map((b: any) => b.name).join(', ')}`);
+            }
+            const impls = data?.implementations || [];
+            if (impls.length > 0) {
+                console.log(`\nImplementations (${impls.length}):`);
+                for (const impl of impls.slice(0, 30)) {
+                    const lua = impl.luaUsages > 0 ? ` [Lua: ${impl.luaUsages}]` : '';
+                    console.log(`  ${impl.name} — ${impl.file}:${impl.line}${lua}`);
+                }
+                if (impls.length > 30) console.log(`  ... ${impls.length - 30} more`);
+            }
             break;
         }
 

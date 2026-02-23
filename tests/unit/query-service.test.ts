@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { QueryService } from '../../src/core/query-service.js';
 import { CacheManager, type CachedSymbol } from '../../src/cache/cache-manager.js';
 import * as fs from 'fs';
+import * as fsp from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 
@@ -473,5 +474,113 @@ describe('QueryService', () => {
             expect(result.incoming).toHaveLength(1);
             expect(result.incoming[0].name).toBe('Execute');
         });
+    });
+});
+
+describe('findHierarchy — grep patterns', () => {
+    it('grepSubclasses pattern matches class inheritance', () => {
+        const pattern = /\b(?:class|struct|interface)\s+(\w+)(?:<[^>]*>)?\s*:[^{]*\bBase\b/;
+        expect(pattern.exec('  public class ChildA : Base {')?.[1]).toBe('ChildA');
+        expect(pattern.exec('  public class ChildB : Base, IFoo {')?.[1]).toBe('ChildB');
+    });
+
+    it('does NOT match class itself in inheritance list', () => {
+        const pattern = /\b(?:class|struct|interface)\s+(\w+)(?:<[^>]*>)?\s*:[^{]*\bBase\b/;
+        // "Base" appears as the class name, not in the inheritance part
+        expect(pattern.exec('public class Base : System.Object {')).toBeNull();
+    });
+
+    it('matches interface implementations', () => {
+        const pattern = /\b(?:class|struct|interface)\s+(\w+)(?:<[^>]*>)?\s*:[^{]*\bIDisposable\b/;
+        expect(pattern.exec('public class MyService : IDisposable, ICloneable {')?.[1]).toBe('MyService');
+    });
+
+    it('matches generic class inheritance', () => {
+        const pattern = /\b(?:class|struct|interface)\s+(\w+)(?:<[^>]*>)?\s*:[^{]*\bList\b/;
+        expect(pattern.exec('public class SpecialList<T> : List<T>, IEnumerable {')?.[1]).toBe('SpecialList');
+    });
+
+    it('matches struct inheritance', () => {
+        const pattern = /\b(?:class|struct|interface)\s+(\w+)(?:<[^>]*>)?\s*:[^{]*\bIEquatable\b/;
+        expect(pattern.exec('public struct MyVal : IEquatable<MyVal> {')?.[1]).toBe('MyVal');
+    });
+
+    it('parseBaseTypes extracts base types from declaration', () => {
+        const declLine = '  public class Foo : Bar, IBaz {';
+        const match = declLine.match(/:\s*([^{]+?)(?:\s+where\b|\s*\{)/);
+        expect(match).not.toBeNull();
+        const types = match![1].split(',').map(t => t.trim().replace(/<[^>]*>/g, ''));
+        expect(types).toEqual(['Bar', 'IBaz']);
+    });
+
+    it('parseBaseTypes handles generic constraints', () => {
+        const declLine = 'class Foo<T> : Bar<T> where T : class {';
+        const match = declLine.match(/:\s*([^{]+?)(?:\s+where\b|\s*\{)/);
+        expect(match).not.toBeNull();
+        const types = match![1].split(',').map(t => t.trim().replace(/<[^>]*>/g, ''));
+        expect(types).toEqual(['Bar']);
+    });
+});
+
+describe('grepLuaMethodCalls', () => {
+    let tmpDir: string;
+    let dbPath: string;
+    let cache: CacheManager;
+    let service: QueryService;
+
+    beforeEach(async () => {
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'csg-grep-'));
+        dbPath = path.join(tmpDir, 'test.db');
+        cache = new CacheManager(dbPath);
+        const mockLsp = {
+            getClientForFile: vi.fn().mockReturnValue({ state: 'ready' }),
+            getClientForLanguage: vi.fn().mockReturnValue({ state: 'ready' }),
+            getStatus: vi.fn().mockReturnValue({ csharp: { state: 'ready' }, lua: { state: 'ready' }, allReady: true }),
+            getLspStatusForMcp: vi.fn().mockReturnValue({}),
+        } as any;
+        service = new QueryService(mockLsp, cache, tmpDir);
+    });
+
+    afterEach(async () => {
+        cache.close();
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('matches colon method calls: obj:Method()', async () => {
+        await fsp.writeFile(path.join(tmpDir, 'a.lua'),
+            'self.guideMask:ClickOption()\nlocal x = 1\n');
+        const results = await service.grepLuaMethodCalls('ClickOption');
+        expect(results).toHaveLength(1);
+        expect(results[0].line).toBe(1);
+        expect(results[0].file).toBe('a.lua');
+    });
+
+    it('matches dot method calls: obj.Method()', async () => {
+        await fsp.writeFile(path.join(tmpDir, 'b.lua'),
+            'mgr.Update(dt)\n');
+        const results = await service.grepLuaMethodCalls('Update');
+        expect(results).toHaveLength(1);
+        expect(results[0].line).toBe(1);
+    });
+
+    it('does NOT match bare variable assignment: local ClickOption = ...', async () => {
+        await fsp.writeFile(path.join(tmpDir, 'c.lua'),
+            'local ClickOption = function() end\nClickOption = nil\n');
+        const results = await service.grepLuaMethodCalls('ClickOption');
+        expect(results).toHaveLength(0);
+    });
+
+    it('respects limit parameter', async () => {
+        const lines = Array.from({ length: 20 }, (_, i) => `obj:ClickOption() -- ${i}`).join('\n');
+        await fsp.writeFile(path.join(tmpDir, 'd.lua'), lines);
+        const results = await service.grepLuaMethodCalls('ClickOption', 5);
+        expect(results.length).toBeLessThanOrEqual(5);
+    });
+
+    it('returns results from multiple files', async () => {
+        await fsp.writeFile(path.join(tmpDir, 'e1.lua'), 'a:Foo()\n');
+        await fsp.writeFile(path.join(tmpDir, 'e2.lua'), 'b:Foo()\n');
+        const results = await service.grepLuaMethodCalls('Foo');
+        expect(results.length).toBe(2);
     });
 });

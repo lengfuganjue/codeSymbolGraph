@@ -357,6 +357,19 @@ export class CacheManager {
 
             CREATE INDEX IF NOT EXISTS idx_alias_file ON lua_aliases(alias_file);
 
+            CREATE TABLE IF NOT EXISTS getcomponent_fields (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                field_name TEXT NOT NULL,
+                type_name TEXT NOT NULL,
+                lua_file TEXT NOT NULL,
+                lua_line INTEGER NOT NULL,
+                file_hash TEXT NOT NULL DEFAULT '',
+                UNIQUE(field_name, lua_file, lua_line)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_gcf_field ON getcomponent_fields(field_name);
+            CREATE INDEX IF NOT EXISTS idx_gcf_file  ON getcomponent_fields(lua_file);
+
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT

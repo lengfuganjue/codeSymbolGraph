@@ -14,6 +14,7 @@ import {
     handleCallChain,
     handleCrossLang,
     handleImpact,
+    handleHierarchy,
     handleStatus,
     handleFindAsset,
     handleFindProtocol,
@@ -163,6 +164,18 @@ export function registerTools(
         },
         async (args) => wrapTool(lspManager, indexingReady, () =>
             handleImpact(ctx, args),
+        ),
+    );
+
+    // ===== csg_hierarchy =====
+    server.tool(
+        'csg_hierarchy',
+        '查询 C# 类/接口的继承树：基类、实现的接口、所有子类/实现类。返回各实现类的 Lua 跨语言使用数量。',
+        {
+            name: z.string().describe('C# 类名或接口名（如 "IInventorySystem" 或 "MonoBehaviour"）'),
+        },
+        async (args) => wrapTool(lspManager, indexingReady, () =>
+            handleHierarchy(ctx, args),
         ),
     );
 

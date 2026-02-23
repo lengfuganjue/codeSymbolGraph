@@ -10,6 +10,7 @@ import {
     handleCallChain,
     handleCrossLang,
     handleImpact,
+    handleHierarchy,
     handleStatus,
     handleFindAsset,
     handleFindProtocol,
@@ -166,6 +167,8 @@ export class DaemonHttpServer {
                 return handleCrossLang(this.ctx, args as any);
             case '/api/impact':
                 return handleImpact(this.ctx, args as any);
+            case '/api/hierarchy':
+                return handleHierarchy(this.ctx, args as any);
             case '/api/find-asset':
                 return handleFindAsset(this.ctx, args as any);
             case '/api/find-protocol':

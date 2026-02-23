@@ -606,10 +606,128 @@ export class QueryService {
             }
         }
 
-        // outgoing 需要 AST 分析，当前仅通过 references 实现 incoming
-        // outgoing 留空，后续可通过 Roslyn API 增强
+        if (query.direction !== 'incoming') {
+            let useCallHierarchy = false;
+            try {
+                useCallHierarchy = this.lspManager.supportsCallHierarchy(file);
+            } catch { /* unsupported file type */ }
+
+            if (useCallHierarchy) {
+                try {
+                    result.outgoing = await this.findOutgoingCallsViaCallHierarchy(
+                        file, line, character, maxDepth, 0, new Set(),
+                    );
+                    console.error(`[CSG] outgoing callHierarchy: ${result.outgoing.length} calls`);
+                } catch (e) {
+                    console.error(`[CSG] outgoing callHierarchy threw: ${(e as Error).message}`);
+                }
+            }
+        }
 
         return result;
+    }
+
+    // ===== 类继承树查询 =====
+
+    /**
+     * 查找类/接口的继承关系：
+     * - baseTypes：直接基类/实现的接口（从声明行解析）
+     * - implementations：所有子类/实现类（grep .cs 文件）
+     */
+    async findHierarchy(name: string): Promise<HierarchyResult> {
+        const resolved = await this.resolveSymbol(name);
+        const target = resolved.length > 0 ? resolved[0] : null;
+
+        if (!target) {
+            return { target: null, baseTypes: [], implementations: [] };
+        }
+
+        const shortName = target.fqn.split('.').pop()!;
+
+        const [baseTypes, implementations] = await Promise.all([
+            this.parseBaseTypes(target.file, target.line),
+            this.grepSubclasses(shortName),
+        ]);
+
+        return { target, baseTypes, implementations };
+    }
+
+    /**
+     * 从类声明行解析直接基类/接口：
+     * `class Foo : Bar, IBaz` → [{name:"Bar"}, {name:"IBaz"}]
+     */
+    private async parseBaseTypes(
+        file: string, line: number,
+    ): Promise<{ name: string }[]> {
+        try {
+            const absPath = path.join(this.workspaceRoot, file);
+            const content = await fs.readFile(absPath, 'utf-8');
+            const lines = content.split('\n');
+
+            // 读声明行及后续几行（处理多行声明）
+            const startIdx = Math.max(0, line); // line is 0-based
+            const declText = lines.slice(startIdx, startIdx + 5).join(' ');
+
+            // 匹配 `: Type1, Type2` 直到 `{` 或 `where`
+            const match = declText.match(/:\s*([^{]+?)(?:\s+where\b|\s*\{)/);
+            if (!match) return [];
+
+            return match[1]
+                .split(',')
+                .map(t => t.trim().replace(/<[^>]*>/g, ''))  // 去泛型参数
+                .filter(t => t.length > 0 && /^[A-Z]/.test(t))
+                .map(t => ({ name: t }));
+        } catch {
+            return [];
+        }
+    }
+
+    /**
+     * Grep 所有 .cs 文件，查找继承/实现了目标类名的声明
+     * 匹配 `class/struct/interface X : ...TargetName...`
+     */
+    private async grepSubclasses(
+        className: string,
+    ): Promise<{ name: string; file: string; line: number }[]> {
+        const results: { name: string; file: string; line: number }[] = [];
+        const escaped = className.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const pattern = new RegExp(
+            `\\b(?:class|struct|interface)\\s+(\\w+)(?:<[^>]*>)?\\s*:[^{]*\\b${escaped}\\b`,
+        );
+
+        try {
+            const csFiles = await glob('**/*.cs', {
+                cwd: this.workspaceRoot,
+                absolute: false,
+                ignore: ['**/node_modules/**', '**/Library/**', '**/Temp/**'],
+            });
+
+            for (const file of csFiles) {
+                if (isGeneratedCode(file)) continue;
+
+                const absPath = path.join(this.workspaceRoot, file);
+                let content: string;
+                try { content = await fs.readFile(absPath, 'utf-8'); } catch { continue; }
+
+                const lines = content.split('\n');
+                for (let i = 0; i < lines.length; i++) {
+                    const match = pattern.exec(lines[i]);
+                    if (match && match[1] !== className) { // 排除自身
+                        results.push({
+                            name: match[1],
+                            file: file.replace(/\\/g, '/'),
+                            line: i + 1,
+                        });
+                    }
+                }
+
+                if (results.length >= 200) break;
+            }
+        } catch (e) {
+            console.error(`[CSG] grepSubclasses error: ${(e as Error).message}`);
+        }
+
+        return results;
     }
 
     /**
@@ -664,6 +782,67 @@ export class QueryService {
         }
 
         return nodes;
+    }
+
+    /**
+     * 通过 callHierarchy/outgoingCalls 获取"这个方法调用了哪些方法"
+     * 递归展开到 maxDepth 层
+     */
+    private async findOutgoingCallsViaCallHierarchy(
+        file: string,
+        line: number,      // 1-based
+        character: number,
+        maxDepth: number,
+        currentDepth: number,
+        visited: Set<string>,
+    ): Promise<CallChainNode[]> {
+        if (currentDepth >= maxDepth) return [];
+
+        const visitKey = `${file}:${line}`;
+        if (visited.has(visitKey)) return [];
+        visited.add(visitKey);
+
+        try {
+            const client = this.lspManager.getClientForFile(file);
+            const uri = relativeToUri(this.workspaceRoot, file);
+
+            const items = await client.callHierarchyPrepare(uri, line - 1, character);
+            if (!items || items.length === 0) return [];
+
+            const outgoingCalls = await client.callHierarchyOutgoing(items[0]);
+            if (!outgoingCalls || outgoingCalls.length === 0) return [];
+
+            const nodes: CallChainNode[] = [];
+            for (const call of outgoingCalls) {
+                const to = call.to;
+                const calleeFile = uriToRelative(this.workspaceRoot, to.uri);
+                const calleeLine = to.range.start.line + 1;
+
+                // 跳过生成代码（XLua Wrap 等），减少噪音
+                if (isGeneratedCode(calleeFile)) continue;
+
+                const node: CallChainNode = {
+                    name: to.name,
+                    fqn: to.name,
+                    kind: to.kind,
+                    file: calleeFile,
+                    line: calleeLine,
+                    children: [],
+                };
+
+                node.children = await this.findOutgoingCallsViaCallHierarchy(
+                    calleeFile, calleeLine, to.range.start.character,
+                    maxDepth, currentDepth + 1, visited,
+                );
+
+                nodes.push(node);
+            }
+
+            return nodes;
+        } catch (e) {
+            if (e instanceof LspTimeoutError) return [];
+            throw e;
+        }
     }
 
     /**
@@ -1154,6 +1333,55 @@ export class QueryService {
         return results;
     }
 
+    /**
+     * 正则扫描所有 Lua 文件查找方法调用（GetComponent 动态绑定 fallback）。
+     * 使用 [:.]\s* 前缀精确匹配方法调用，不匹配定义或赋值。
+     */
+    public async grepLuaMethodCalls(
+        memberName: string,
+        limit = 100,
+    ): Promise<{ file: string; line: number; character: number }[]> {
+        const results: { file: string; line: number; character: number }[] = [];
+        const escaped = memberName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const pattern = new RegExp(`[:.][\\s]*${escaped}\\s*\\(`, 'g');
+
+        try {
+            const luaFiles = await glob('**/*.lua', {
+                cwd: this.workspaceRoot,
+                absolute: false,
+                ignore: ['**/node_modules/**', '**/Library/**', '**/Temp/**'],
+            });
+
+            for (const file of luaFiles) {
+                const absPath = path.join(this.workspaceRoot, file);
+                let content: string;
+                try {
+                    content = await fs.readFile(absPath, 'utf-8');
+                } catch { continue; }
+
+                const lines = content.split('\n');
+                for (let i = 0; i < lines.length; i++) {
+                    pattern.lastIndex = 0;
+                    const match = pattern.exec(lines[i]);
+                    if (match) {
+                        results.push({
+                            file: file.replace(/\\/g, '/'),
+                            line: i + 1,
+                            character: match.index + 1, // +1：跳过前缀 [:.] 指向方法名
+                        });
+                        if (results.length >= limit) break;
+                    }
+                }
+
+                if (results.length >= limit) break;
+            }
+        } catch (e) {
+            console.error(`[CSG] grepLuaMethodCalls error: ${(e as Error).message}`);
+        }
+
+        return results;
+    }
+
     private async enrichWithHover(sym: ResolvedSymbol): Promise<ResolvedSymbol> {
         try {
             const client = this.lspManager.getClientForFile(sym.file);
@@ -1238,4 +1466,10 @@ export interface CallChainNode {
     file: string;
     line: number;
     children: CallChainNode[];
+}
+
+export interface HierarchyResult {
+    target: ResolvedSymbol | null;
+    baseTypes: { name: string }[];
+    implementations: { name: string; file: string; line: number }[];
 }

@@ -45,7 +45,7 @@ describe('uri utils', () => {
             expect(backRel).toBe('Assets/Scripts/Player.cs');
         });
 
-        it('should normalize backslashes in result', () => {
+        it.skipIf(process.platform !== 'win32')('should normalize backslashes in result (Windows only)', () => {
             const root = 'C:\\workspace\\project';
             const uri = pathToUri('C:\\workspace\\project\\src\\main.lua');
             const rel = uriToRelative(root, uri);

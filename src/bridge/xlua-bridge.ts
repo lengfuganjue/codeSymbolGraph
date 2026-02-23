@@ -10,6 +10,13 @@ import type { SymbolInformation } from 'vscode-languageserver-protocol';
 /** 直接 CS. 调用: CS.Namespace.Class:method() 或 CS.Namespace.Class.method() */
 const CS_CALL_PATTERN = /CS\.([\w.]+)[:\.](\w+)\s*\(/g;
 
+/**
+ * GetComponent 动态绑定: self.fieldName = xxx:GetComponent("TypeName") 或 :GetComponent(CS.Type)
+ * group1=fieldName, group2=字符串参数TypeName, group3=CS.参数Type
+ */
+const GETCOMPONENT_PATTERN =
+    /\bself\.(\w+)\s*=\s*\w+:GetComponent\s*\(\s*(?:"([\w.]+)"|CS\.([\w.]+))\s*\)/gm;
+
 /** 通过别名的调用: identifier:method() 或 identifier.method() */
 const ALIAS_CALL_PATTERN = /\b(\w+)\s*[:.]\s*(\w+)\s*\(/g;
 
@@ -20,6 +27,14 @@ const ALIAS_CALL_PATTERN = /\b(\w+)\s*[:.]\s*(\w+)\s*\(/g;
  */
 const RAW_GLOBAL_ALIAS = /^\s*(\w+)\s*=\s*((?:CS\.)?[\w.]+)/gm;
 const RAW_LOCAL_ALIAS = /\blocal\s+(\w+)\s*=\s*((?:CS\.)?[\w.]+)/gm;
+
+interface GetComponentField {
+    fieldName: string;    // e.g. "guideMask"
+    typeName: string;     // e.g. "GotoMask"（短名）或 "Game.GotoMask"（FQN）
+    isShortName: boolean; // true=字符串参数，false=CS.参数
+    file: string;
+    line: number;
+}
 
 interface RawAlias {
     name: string;
@@ -140,6 +155,32 @@ export class XLuaBridge {
             rawAliases.push(...this.extractRawAliases(file, content));
         }
 
+        // ===== Phase 1.5: 提取 GetComponent 字段映射 =====
+        const allGetComponentFields: GetComponentField[] = [];
+        for (const [file, content] of fileContents) {
+            allGetComponentFields.push(...this.extractGetComponentFields(file, content));
+        }
+        const fieldTypeLookup = new Map<string, GetComponentField>();
+        for (const f of allGetComponentFields) {
+            // 同名字段以 CS. 参数（非短名）优先，更准确
+            if (!fieldTypeLookup.has(f.fieldName) || !f.isShortName) {
+                fieldTypeLookup.set(f.fieldName, f);
+            }
+        }
+        // 全量写入 getcomponent_fields 表
+        const insertGcf = this.cache.db.prepare(`
+            INSERT OR REPLACE INTO getcomponent_fields
+            (field_name, type_name, lua_file, lua_line, file_hash)
+            VALUES (?, ?, ?, ?, '')
+        `);
+        this.cache.db.transaction(() => {
+            this.cache.db.prepare('DELETE FROM getcomponent_fields').run();
+            for (const f of allGetComponentFields) {
+                insertGcf.run(f.fieldName, f.typeName, f.file, f.line);
+            }
+        })();
+        console.error(`[CSG] getcomponent: ${allGetComponentFields.length} fields, ${fieldTypeLookup.size} unique`);
+
         // ===== Phase 2: 解析别名链 =====
         this.aliasLookup = this.resolveAliasChains(rawAliases);
         console.error(`[CSG] alias chain: ${rawAliases.length} raw → ${this.aliasLookup.size} resolved`);
@@ -149,7 +190,7 @@ export class XLuaBridge {
         const aliasCalls: XLuaCall[] = [];
         for (const [file, content] of fileContents) {
             directCalls.push(...this.extractCsCalls(file, content));
-            aliasCalls.push(...this.extractAliasCalls(file, content, this.aliasLookup));
+            aliasCalls.push(...this.extractAliasCalls(file, content, this.aliasLookup, fieldTypeLookup));
         }
         const dedupDirect = this.deduplicateCalls(directCalls);
         const dedupAlias = this.deduplicateCalls(aliasCalls);
@@ -269,9 +310,27 @@ export class XLuaBridge {
             }
         }
 
+        // 增量更新 getcomponent_fields
+        this.cache.db.prepare('DELETE FROM getcomponent_fields WHERE lua_file = ?').run(filePath);
+        const gcFields = this.extractGetComponentFields(filePath, content);
+        const insertGcf = this.cache.db.prepare(`
+            INSERT OR REPLACE INTO getcomponent_fields
+            (field_name, type_name, lua_file, lua_line, file_hash)
+            VALUES (?, ?, ?, ?, '')
+        `);
+        for (const f of gcFields) {
+            insertGcf.run(f.fieldName, f.typeName, f.file, f.line);
+        }
+        const fieldTypeLookup = new Map<string, GetComponentField>();
+        for (const f of gcFields) {
+            if (!fieldTypeLookup.has(f.fieldName) || !f.isShortName) {
+                fieldTypeLookup.set(f.fieldName, f);
+            }
+        }
+
         const calls = [
             ...this.extractCsCalls(filePath, content),
-            ...this.extractAliasCalls(filePath, content, this.aliasLookup),
+            ...this.extractAliasCalls(filePath, content, this.aliasLookup, fieldTypeLookup),
         ];
         const deduped = this.deduplicateCalls(calls);
         const aliases = rawAliases
@@ -522,10 +581,14 @@ export class XLuaBridge {
      * 对每个 identifier:method() 或 identifier.method()，
      * 如果 identifier 在 aliasLookup 中，记录为 C# 跨语言调用。
      * 跳过 UnityEngine/System 等引擎 API 别名（数千个 Vector3.new() 没有跟踪价值）
+     *
+     * fieldTypeLookup：GetComponent 动态绑定映射，当 aliasLookup 无匹配时作为 fallback。
+     * 仅处理 isShortName=false（CS. 参数）的条目，短名无法确定完整命名空间。
      */
     private extractAliasCalls(
         filePath: string, content: string,
         aliasLookup: Map<string, string>,
+        fieldTypeLookup?: Map<string, GetComponentField>,
     ): XLuaCall[] {
         const calls: XLuaCall[] = [];
         let match;
@@ -540,11 +603,20 @@ export class XLuaBridge {
             const prefix = content.substring(prefixStart, match.index);
             if (prefix.endsWith('CS.')) continue;
 
+            let className: string;
             const resolvedFqn = aliasLookup.get(varName);
-            if (!resolvedFqn) continue;
+            if (resolvedFqn) {
+                className = resolvedFqn.replace(/^CS\./, '');
+            } else if (fieldTypeLookup) {
+                // GetComponent 动态绑定 fallback（仅 CS. 参数，短名跳过）
+                const gcf = fieldTypeLookup.get(varName);
+                if (!gcf || gcf.isShortName) continue;
+                className = gcf.typeName;
+            } else {
+                continue;
+            }
 
             // 跳过引擎/框架 API 别名（只跟踪项目自有类）
-            const className = resolvedFqn.replace(/^CS\./, '');
             if (this.isBuiltinNamespace(className)) continue;
 
             const line = this.getLineNumber(content, match.index);
@@ -560,6 +632,43 @@ export class XLuaBridge {
         }
 
         return calls;
+    }
+
+    /**
+     * 提取文件中的 GetComponent 动态绑定：
+     * self.fieldName = xxx:GetComponent("TypeName")  → isShortName=true
+     * self.fieldName = xxx:GetComponent(CS.Type)     → isShortName=false
+     */
+    private extractGetComponentFields(filePath: string, content: string): GetComponentField[] {
+        const fields: GetComponentField[] = [];
+        let match;
+        GETCOMPONENT_PATTERN.lastIndex = 0;
+
+        while ((match = GETCOMPONENT_PATTERN.exec(content)) !== null) {
+            const fieldName = match[1];
+            const stringArg = match[2]; // "TypeName" 形式
+            const csArg = match[3];     // CS.Type 形式
+
+            if (csArg) {
+                fields.push({
+                    fieldName,
+                    typeName: csArg,  // 已去掉 CS. 前缀
+                    isShortName: false,
+                    file: filePath,
+                    line: this.getLineNumber(content, match.index),
+                });
+            } else if (stringArg) {
+                fields.push({
+                    fieldName,
+                    typeName: stringArg,
+                    isShortName: true,
+                    file: filePath,
+                    line: this.getLineNumber(content, match.index),
+                });
+            }
+        }
+
+        return fields;
     }
 
     /** 判断是否引擎/框架命名空间（不需要跟踪跨语言调用） */

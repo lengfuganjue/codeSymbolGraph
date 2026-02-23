@@ -14,6 +14,11 @@ export function isUnityOldFormat(content: string): boolean {
     return content.includes('TargetFrameworkVersion') || content.includes('UnityProjectGenerator');
 }
 
+/** 检测 csproj 是否是 Unity 项目（旧格式或新版 SDK-style 都算） */
+export function isUnityProject(content: string): boolean {
+    return content.includes('UnityProjectGenerator') || content.includes('TargetFrameworkVersion');
+}
+
 /** 应该跳过的 csproj：Editor、Player、Tests */
 function shouldSkipCsproj(fileName: string): boolean {
     const name = fileName.toLowerCase();
@@ -36,6 +41,22 @@ function extractCompileItems(content: string): string[] {
     return items;
 }
 
+export interface DllReference {
+    name: string;
+    hintPath: string;
+}
+
+/** 从 csproj 内容中提取所有 <Reference Include="..."><HintPath>...</HintPath></Reference> */
+function extractReferences(content: string): DllReference[] {
+    const refs: DllReference[] = [];
+    const regex = /<Reference\s+Include="([^"]+)"[\s\S]*?<HintPath>([^<]+)<\/HintPath>[\s\S]*?<\/Reference>/g;
+    let match;
+    while ((match = regex.exec(content)) !== null) {
+        refs.push({ name: match[1], hintPath: match[2] });
+    }
+    return refs;
+}
+
 function generateGuid(name: string): string {
     const hash = crypto.createHash('md5').update(name).digest('hex');
     return `{${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}}`;
@@ -47,6 +68,8 @@ export interface ConvertResult {
     sourceProjectCount: number;
     /** 合并后的 Compile 项数 */
     compileItemCount: number;
+    /** 合并后的 DLL 引用数 */
+    referenceCount: number;
     skippedCount: number;
 }
 
@@ -59,6 +82,8 @@ export function convertUnityProject(projectRoot: string): ConvertResult {
         .filter(f => f.endsWith('.csproj') && !f.endsWith('-sdk.csproj'));
 
     const allCompileItems = new Set<string>();
+    // key=name, value=hintPath — 按 name 去重
+    const allReferences = new Map<string, string>();
     let sourceCount = 0;
     let skipped = 0;
 
@@ -71,7 +96,7 @@ export function convertUnityProject(projectRoot: string): ConvertResult {
         const inputPath = path.join(projectRoot, file);
         const content = fs.readFileSync(inputPath, 'utf-8');
 
-        if (!isUnityOldFormat(content)) {
+        if (!isUnityOldFormat(content) && !isUnityProject(content)) {
             skipped++;
             continue;
         }
@@ -80,10 +105,24 @@ export function convertUnityProject(projectRoot: string): ConvertResult {
         for (const item of extractCompileItems(content)) {
             allCompileItems.add(item);
         }
+        for (const ref of extractReferences(content)) {
+            if (!allReferences.has(ref.name)) {
+                allReferences.set(ref.name, ref.hintPath);
+            }
+        }
     }
 
     if (allCompileItems.size === 0) {
         throw new Error('未找到任何可转换的 Unity .csproj 或 Compile 项');
+    }
+
+    // 过滤掉文件不存在的 DLL 引用
+    const validReferences: Array<[string, string]> = [];
+    for (const [name, hintPath] of allReferences) {
+        const absPath = path.isAbsolute(hintPath) ? hintPath : path.join(projectRoot, hintPath);
+        if (fs.existsSync(absPath)) {
+            validReferences.push([name, hintPath]);
+        }
     }
 
     // 生成合并的 SDK csproj
@@ -92,17 +131,25 @@ export function convertUnityProject(projectRoot: string): ConvertResult {
         .map(item => `    <Compile Include="${item}" />`)
         .join('\n');
 
+    const referencesXml = validReferences.length > 0
+        ? '\n  <ItemGroup>\n' + validReferences
+            .sort((a, b) => a[0].localeCompare(b[0]))
+            .map(([name, hp]) => `    <Reference Include="${name}">\n      <HintPath>${hp}</HintPath>\n    </Reference>`)
+            .join('\n') + '\n  </ItemGroup>\n'
+        : '';
+
     const csprojContent = `<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <TargetFramework>netstandard2.1</TargetFramework>
+    <NoWarn>CS0246;CS0234;CS1061;CS0103;CS0117;CS0029;CS0019</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
 ${compileItemsXml}
   </ItemGroup>
-
+${referencesXml}
 </Project>
 `;
 
@@ -134,6 +181,7 @@ EndGlobal
         slnPath: slnFileName,
         sourceProjectCount: sourceCount,
         compileItemCount: allCompileItems.size,
+        referenceCount: validReferences.length,
         skippedCount: skipped,
     };
 }

@@ -7,6 +7,30 @@ const CS_CALL_PATTERN = /CS\.([\w.]+)[:\.](\w+)\s*\(/g;
 const CS_ALIAS_PATTERN = /local\s+(\w+)\s*=\s*CS\.([\w.]+)\s*$/gm;
 const CS_GLOBAL_ALIAS_PATTERN = /^(\w+)\s*=\s*CS\.([\w.]+)\s*$/gm;
 
+/**
+ * GetComponent 动态绑定正则（与 xlua-bridge.ts 保持一致）
+ * group1=fieldName, group2=字符串参数, group3=CS.参数
+ */
+const GETCOMPONENT_PATTERN =
+    /\bself\.(\w+)\s*=\s*\w+:GetComponent\s*\(\s*(?:"([\w.]+)"|CS\.([\w.]+))\s*\)/gm;
+
+function extractGetComponentFields(content: string) {
+    const fields: { fieldName: string; typeName: string; isShortName: boolean }[] = [];
+    let match;
+    GETCOMPONENT_PATTERN.lastIndex = 0;
+    while ((match = GETCOMPONENT_PATTERN.exec(content)) !== null) {
+        const fieldName = match[1];
+        const stringArg = match[2];
+        const csArg = match[3];
+        if (csArg) {
+            fields.push({ fieldName, typeName: csArg, isShortName: false });
+        } else if (stringArg) {
+            fields.push({ fieldName, typeName: stringArg, isShortName: true });
+        }
+    }
+    return fields;
+}
+
 function extractCsCalls(content: string) {
     const calls: { pattern: string; className: string; memberName: string; line: number }[] = [];
     let match;
@@ -221,5 +245,65 @@ C_ResFunc = Yoozoo.Managers.ResourceManagerV2.Runtime.UMTResource`;
             const aliases = extractAliases(content);
             expect(aliases).toHaveLength(0);
         });
+    });
+});
+
+describe('GETCOMPONENT_PATTERN', () => {
+    it('matches string argument form: GetComponent("TypeName")', () => {
+        const content = 'self.guideMask = go:GetComponent("GotoMask")';
+        const fields = extractGetComponentFields(content);
+        expect(fields).toHaveLength(1);
+        expect(fields[0].fieldName).toBe('guideMask');
+        expect(fields[0].typeName).toBe('GotoMask');
+        expect(fields[0].isShortName).toBe(true);
+    });
+
+    it('matches CS. argument form: GetComponent(CS.Game.GotoMask)', () => {
+        const content = 'self.guideMask = go:GetComponent(CS.Game.GotoMask)';
+        const fields = extractGetComponentFields(content);
+        expect(fields).toHaveLength(1);
+        expect(fields[0].fieldName).toBe('guideMask');
+        expect(fields[0].typeName).toBe('Game.GotoMask');
+        expect(fields[0].isShortName).toBe(false);
+    });
+
+    it('captures fieldName correctly for various names', () => {
+        const content = `
+self.btnClose = root:GetComponent(CS.UI.Button)
+self.txtTitle = root:GetComponent("Text")
+`;
+        const fields = extractGetComponentFields(content);
+        expect(fields).toHaveLength(2);
+        expect(fields[0].fieldName).toBe('btnClose');
+        expect(fields[0].typeName).toBe('UI.Button');
+        expect(fields[0].isShortName).toBe(false);
+        expect(fields[1].fieldName).toBe('txtTitle');
+        expect(fields[1].typeName).toBe('Text');
+        expect(fields[1].isShortName).toBe(true);
+    });
+
+    it('does NOT match when receiver is not self', () => {
+        // other.field = xxx:GetComponent(...) 不匹配
+        const content = 'other.mask = go:GetComponent("GotoMask")';
+        const fields = extractGetComponentFields(content);
+        expect(fields).toHaveLength(0);
+    });
+
+    it('matches with spaces around arguments', () => {
+        const content = 'self.panel = go:GetComponent( CS.Game.Panel )';
+        const fields = extractGetComponentFields(content);
+        expect(fields).toHaveLength(1);
+        expect(fields[0].typeName).toBe('Game.Panel');
+    });
+
+    it('handles multiple GetComponent in one file', () => {
+        const content = `
+self.hp = root:GetComponent(CS.Game.HpBar)
+self.name = root:GetComponent("TextMeshPro")
+self.icon = root:GetComponent(CS.UI.Image)
+`;
+        const fields = extractGetComponentFields(content);
+        expect(fields).toHaveLength(3);
+        expect(fields.map(f => f.fieldName)).toEqual(['hp', 'name', 'icon']);
     });
 });

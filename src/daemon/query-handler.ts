@@ -60,6 +60,34 @@ export async function handleFindDefinition(
     }
 }
 
+type CrossLangCallSite = {
+    file: string; line: number; callerFqn?: string; pattern: string; status: string;
+};
+
+/**
+ * 获取跨语言调用点：先查 xlua_mappings，若无结果则 grep Lua 方法调用兜底。
+ * `status: 'lua_grep'` 明确标注来源，让 AI 知道这是正则而非语义分析结果。
+ */
+async function buildCrossLangSites(
+    fqn: string | undefined,
+    xluaResult: { lua?: { callSites?: CrossLangCallSite[] } } | null,
+    queryService: QueryContext['queryService'],
+): Promise<CrossLangCallSite[]> {
+    const sites = xluaResult?.lua?.callSites ?? [];
+    if (sites.length > 0 || !fqn) return sites;
+
+    const memberName = fqn.split('.').pop();
+    if (!memberName || !/^[A-Za-z_]\w*$/.test(memberName)) return [];
+
+    const grepHits = await queryService.grepLuaMethodCalls(memberName, 100);
+    return grepHits.map(h => ({
+        file: h.file,
+        line: h.line,
+        pattern: `[:.] ${memberName}(`,
+        status: 'lua_grep',
+    }));
+}
+
 export async function handleFindReferences(
     ctx: QueryContext,
     args: { name?: string; file?: string; line?: number; column?: number; exclude_generated?: boolean },
@@ -72,15 +100,14 @@ export async function handleFindReferences(
             character: args.column,
         });
 
-        let xluaRefs: unknown = null;
+        let xluaRefs: { lua?: { callSites?: CrossLangCallSite[] } } | null = null;
         if (result.symbolFqn) {
             try {
-                xluaRefs = await ctx.xluaBridge.queryCrossLang(result.symbolFqn);
+                xluaRefs = await ctx.xluaBridge.queryCrossLang(result.symbolFqn) as typeof xluaRefs;
             } catch { /* don't block */ }
         }
 
-        const xluaResult = xluaRefs as { lua?: { callSites?: { file: string; line: number }[] } } | null;
-        const crossLang = xluaResult?.lua?.callSites || [];
+        const crossLang = await buildCrossLangSites(result.symbolFqn, xluaRefs, ctx.queryService);
 
         const excludeGenerated = args.exclude_generated !== false;
         const filteredRefs = excludeGenerated
@@ -93,7 +120,7 @@ export async function handleFindReferences(
             ...(i < 50 ? { snippet: readSnippet(ctx.workspaceRoot, r.file, r.line, 1) } : {}),
         }));
 
-        const crossLangWithSnippet = crossLang.map((c: { file: string; line: number }, i: number) => ({
+        const crossLangWithSnippet = crossLang.map((c, i) => ({
             ...c,
             ...(i < 50 ? { snippet: readSnippet(ctx.workspaceRoot, c.file, c.line, 1) } : {}),
         }));
@@ -134,10 +161,28 @@ export async function handleCallChain(
                 children: addSnippets(n.children),
             }));
 
+        // 对 C# 根符号，补充跨语言 incoming callers（depth=1，不递归）
+        let crossLangIncoming: CrossLangCallSite[] = [];
+        const direction = args.direction || 'both';
+        if (direction === 'incoming' || direction === 'both') {
+            const rootFqn = result.root || undefined;
+            let xluaResult = null;
+            if (rootFqn) {
+                try { xluaResult = await ctx.xluaBridge.queryCrossLang(rootFqn); } catch {}
+            }
+            crossLangIncoming = await buildCrossLangSites(rootFqn, xluaResult, ctx.queryService);
+        }
+
         return successResponse({
             root: result.root,
             incoming: addSnippets(result.incoming),
             outgoing: addSnippets(result.outgoing),
+            ...(crossLangIncoming.length > 0 ? {
+                crossLanguageIncoming: crossLangIncoming.map((c, i) => ({
+                    ...c,
+                    ...(i < 30 ? { snippet: readSnippet(ctx.workspaceRoot, c.file, c.line, 1) } : {}),
+                })),
+            } : {}),
         });
     } finally {
         clearSnippetCache();
@@ -221,7 +266,8 @@ export async function handleImpact(
             })
             .sort((a, b) => b.count - a.count);
 
-        const crossLangImpact = (xluaResult?.lua?.callSites || []).map((c, i) => ({
+        const crossLangSites = await buildCrossLangSites(refs.symbolFqn, xluaResult, ctx.queryService);
+        const crossLangImpact = crossLangSites.map((c, i) => ({
             ...c,
             ...(i < 50 ? { snippet: readSnippet(ctx.workspaceRoot, c.file, c.line, 1) } : {}),
         }));
@@ -232,6 +278,59 @@ export async function handleImpact(
             totalBeforeFilter: refs.count,
             affectedFiles,
             crossLanguageImpact: crossLangImpact,
+        });
+    } finally {
+        clearSnippetCache();
+    }
+}
+
+export async function handleHierarchy(
+    ctx: QueryContext,
+    args: { name: string },
+): Promise<McpToolResponse> {
+    try {
+        const result = await ctx.queryService.findHierarchy(args.name);
+        const lspStatus = ctx.lspManager.getLspStatusForMcp();
+
+        if (!result.target) {
+            return errorResponse(
+                'NO_MATCH',
+                `No class/interface found for: ${args.name}`,
+                lspStatus,
+            );
+        }
+
+        // 对每个实现类，查询跨语言使用情况
+        const implsWithDetails = await Promise.all(
+            result.implementations.slice(0, 30).map(async (impl) => {
+                let luaUsages = 0;
+                try {
+                    const crossLang = await ctx.xluaBridge.queryCrossLang(impl.name);
+                    luaUsages = crossLang?.lua?.callSites?.length ?? 0;
+                } catch { /* don't block */ }
+
+                return {
+                    name: impl.name,
+                    file: impl.file,
+                    line: impl.line,
+                    snippet: readSnippet(ctx.workspaceRoot, impl.file, impl.line, 1),
+                    luaUsages,
+                };
+            }),
+        );
+
+        return successResponse({
+            target: {
+                name: result.target.name,
+                fqn: result.target.fqn,
+                kind: result.target.kind,
+                file: result.target.file,
+                line: result.target.line,
+                snippet: readSnippet(ctx.workspaceRoot, result.target.file, result.target.line, 2),
+            },
+            baseTypes: result.baseTypes,
+            implementations: implsWithDetails,
+            totalImplementations: result.implementations.length,
         });
     } finally {
         clearSnippetCache();
