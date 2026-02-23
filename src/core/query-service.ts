@@ -5,6 +5,7 @@ import { LspTimeoutError } from '../utils/timeout.js';
 import type { Location, DocumentSymbol, SymbolInformation } from 'vscode-languageserver-protocol';
 import { glob } from 'glob';
 import * as fs from 'fs/promises';
+import * as fsSync from 'fs';
 import * as path from 'path';
 
 /** 检测是否是 XLua/代码生成器输出的文件（不应作为定义结果优先返回） */
@@ -827,6 +828,264 @@ export class QueryService {
         return results;
     }
 
+    // ===== 文件依赖查询 =====
+
+    /**
+     * 查询文件的依赖关系（依赖了谁、被谁依赖）。
+     * - Lua: require 依赖 + xlua_mappings 跨语言依赖 + 反向 require 查找
+     * - C#: using 命名空间提取（反向查找暂不支持）
+     */
+    async findFileDeps(
+        file: string,
+        direction: 'deps' | 'dependents' | 'both' = 'both',
+    ): Promise<FileDepsResult> {
+        const isLua = file.endsWith('.lua');
+        const isCsharp = file.endsWith('.cs');
+        const language: 'lua' | 'csharp' = isLua ? 'lua' : 'csharp';
+
+        const result: FileDepsResult = {
+            file,
+            language,
+            deps: {
+                luaRequires: [],
+                csharpUsings: [],
+                crossLangDeps: [],
+            },
+            dependents: {
+                luaRequiredBy: [],
+            },
+        };
+
+        const absPath = path.join(this.workspaceRoot, file);
+        let content: string;
+        try {
+            content = await fs.readFile(absPath, 'utf-8');
+        } catch {
+            return result;
+        }
+
+        if (direction === 'deps' || direction === 'both') {
+            if (isLua) {
+                result.deps.luaRequires = this.extractLuaRequires(content, file);
+                result.deps.crossLangDeps = this.queryXluaMappingsForFile(file);
+            } else if (isCsharp) {
+                result.deps.csharpUsings = this.extractCsharpUsings(content);
+            }
+        }
+
+        if (direction === 'dependents' || direction === 'both') {
+            if (isLua) {
+                result.dependents.luaRequiredBy = await this.findLuaDependents(file);
+            }
+            // C# 反向依赖暂不支持（using 是命名空间级别，无法简单反查文件）
+        }
+
+        return result;
+    }
+
+    /**
+     * 从 Lua 文件内容中提取 require 路径并解析为文件路径。
+     * 支持 require("mod.path") 和 require('mod.path')。
+     */
+    extractLuaRequires(
+        content: string,
+        _sourceFile: string,
+    ): Array<{ module: string; resolvedFile: string | null; line: number }> {
+        const results: Array<{ module: string; resolvedFile: string | null; line: number }> = [];
+        const lines = content.split('\n');
+        const requirePattern = /require\s*\(\s*["']([^"']+)["']\s*\)/g;
+
+        for (let i = 0; i < lines.length; i++) {
+            const trimmed = lines[i].trimStart();
+            if (trimmed.startsWith('--')) continue; // skip Lua single-line comments
+            requirePattern.lastIndex = 0;
+            let match: RegExpExecArray | null;
+            while ((match = requirePattern.exec(lines[i])) !== null) {
+                const modulePath = match[1];
+                const resolvedFile = this.resolveRequirePath(modulePath);
+                results.push({
+                    module: modulePath,
+                    resolvedFile,
+                    line: i + 1,
+                });
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * 将 Lua require 模块路径转为文件路径。
+     * 如 "LuaModules.UILib.Base.PageBase" → "Lua/LuaModules/UILib/Base/PageBase.lua"
+     * 在 workspaceRoot 下查找，优先在 luaRoot 下搜索。
+     */
+    private resolveRequirePath(modulePath: string): string | null {
+        const relativePath = modulePath.replace(/\./g, '/') + '.lua';
+
+        // 尝试直接在 workspaceRoot 下查找
+        const directPath = path.join(this.workspaceRoot, relativePath);
+        try {
+            fsSync.accessSync(directPath);
+            return relativePath.replace(/\\/g, '/');
+        } catch { /* not found */ }
+
+        // 尝试在常见 Lua 目录下查找
+        const luaDirs = ['Lua', 'lua', 'LuaScripts', 'Assets/LuaScripts', 'Assets/Lua'];
+        for (const dir of luaDirs) {
+            const candidate = path.join(this.workspaceRoot, dir, relativePath);
+            try {
+                fsSync.accessSync(candidate);
+                return (dir + '/' + relativePath).replace(/\\/g, '/');
+            } catch { /* continue */ }
+        }
+
+        return null;
+    }
+
+    /**
+     * 从 xlua_mappings 缓存表查询指定 Lua 文件的跨语言依赖。
+     */
+    private queryXluaMappingsForFile(
+        luaFile: string,
+    ): Array<{ csharpFqn: string; luaAlias?: string }> {
+        try {
+            const rows = this.cache.db.prepare(
+                `SELECT DISTINCT csharp_fqn, lua_call_pattern FROM xlua_mappings WHERE lua_file = ? AND csharp_fqn IS NOT NULL`,
+            ).all(luaFile) as Array<{ csharp_fqn: string; lua_call_pattern: string }>;
+
+            return rows.map(r => ({
+                csharpFqn: r.csharp_fqn,
+                luaAlias: r.lua_call_pattern !== r.csharp_fqn ? r.lua_call_pattern : undefined,
+            }));
+        } catch {
+            return [];
+        }
+    }
+
+    /**
+     * 从 C# 文件内容中提取 using 命名空间声明。
+     * 排除 using static、using alias = 等形式。
+     */
+    extractCsharpUsings(
+        content: string,
+    ): Array<{ namespace: string; line: number }> {
+        const results: Array<{ namespace: string; line: number }> = [];
+        const lines = content.split('\n');
+        const usingPattern = /^using\s+([\w.]+)\s*;/;
+
+        for (let i = 0; i < lines.length; i++) {
+            const trimmed = lines[i].trim();
+            // 排除 using static、using alias =、using var（using declaration）
+            if (trimmed.startsWith('using static ')) continue;
+            if (/^using\s+\w+\s*=/.test(trimmed)) continue;
+
+            const match = usingPattern.exec(trimmed);
+            if (match) {
+                results.push({
+                    namespace: match[1],
+                    line: i + 1,
+                });
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * 查找哪些 Lua 文件 require 了指定文件（反向依赖）。
+     * 将文件路径转为可能的模块路径，然后 grep 所有 Lua 文件。
+     */
+    private async findLuaDependents(
+        luaFile: string,
+    ): Promise<Array<{ file: string; line: number }>> {
+        // 将文件路径转为可能的 require 模块路径
+        const modulePaths = this.fileToModulePaths(luaFile);
+        if (modulePaths.length === 0) return [];
+
+        const results: Array<{ file: string; line: number }> = [];
+        const seen = new Set<string>();
+
+        try {
+            const luaFiles = await glob('**/*.lua', {
+                cwd: this.workspaceRoot,
+                absolute: false,
+                ignore: ['**/node_modules/**', '**/Library/**', '**/Temp/**'],
+            });
+
+            // 构建 require 模式匹配
+            const patterns = modulePaths.map(mp => {
+                const escaped = mp.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                return new RegExp(`require\\s*\\(\\s*["']${escaped}["']\\s*\\)`);
+            });
+
+            for (const file of luaFiles) {
+                // 不搜索自身
+                if (file.replace(/\\/g, '/') === luaFile.replace(/\\/g, '/')) continue;
+
+                const absPath = path.join(this.workspaceRoot, file);
+                let content: string;
+                try {
+                    content = await fs.readFile(absPath, 'utf-8');
+                } catch { continue; }
+
+                const lines = content.split('\n');
+                for (let i = 0; i < lines.length; i++) {
+                    for (const pattern of patterns) {
+                        if (pattern.test(lines[i])) {
+                            const key = `${file}:${i + 1}`;
+                            if (!seen.has(key)) {
+                                seen.add(key);
+                                results.push({
+                                    file: file.replace(/\\/g, '/'),
+                                    line: i + 1,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                if (results.length >= 500) break;
+            }
+        } catch (e) {
+            console.error(`[CSG] findLuaDependents error: ${(e as Error).message}`);
+        }
+
+        return results;
+    }
+
+    /**
+     * 将 Lua 文件路径转为可能的 require 模块路径。
+     * 如 "Lua/games/systems/GuideManager.lua" → ["games.systems.GuideManager", "Lua.games.systems.GuideManager"]
+     */
+    private fileToModulePaths(luaFile: string): string[] {
+        const normalized = luaFile.replace(/\\/g, '/');
+        // 去 .lua 后缀
+        const withoutExt = normalized.replace(/\.lua$/, '');
+
+        const results: string[] = [];
+
+        const addModulePaths = (base: string) => {
+            results.push(base.replace(/\//g, '.'));
+            // init.lua convention: require("foo.bar") can resolve to foo/bar/init.lua
+            if (base.endsWith('/init')) {
+                results.push(base.slice(0, -'/init'.length).replace(/\//g, '.'));
+            }
+        };
+
+        // 完整路径转为模块路径
+        addModulePaths(withoutExt);
+
+        // 尝试去掉常见 Lua 根目录前缀
+        const luaDirs = ['Lua/', 'lua/', 'LuaScripts/', 'Assets/LuaScripts/', 'Assets/Lua/'];
+        for (const dir of luaDirs) {
+            if (normalized.startsWith(dir)) {
+                addModulePaths(withoutExt.substring(dir.length));
+            }
+        }
+
+        return [...new Set(results)]; // 去重
+    }
+
     /**
      * 通过 callHierarchy 直接获取 incoming callers（LuaLS 支持）
      */
@@ -1577,4 +1836,17 @@ export interface TaggedClassResult {
     line: number;
     tag: string;
     tagType: 'attribute' | 'base_class';
+}
+
+export interface FileDepsResult {
+    file: string;
+    language: 'lua' | 'csharp';
+    deps: {
+        luaRequires: Array<{ module: string; resolvedFile: string | null; line: number }>;
+        csharpUsings: Array<{ namespace: string; line: number }>;
+        crossLangDeps: Array<{ csharpFqn: string; luaAlias?: string }>;
+    };
+    dependents: {
+        luaRequiredBy: Array<{ file: string; line: number }>;
+    };
 }

@@ -737,6 +737,7 @@ program
             'check-csharp': { endpoint: '/api/check-csharp', method: 'POST' },
             'hierarchy': { endpoint: '/api/hierarchy', method: 'POST' },
             'find-tagged': { endpoint: '/api/find-tagged', method: 'POST' },
+            'find-deps': { endpoint: '/api/file-deps', method: 'POST' },
         };
 
         const mapping = toolMap[tool];
@@ -753,7 +754,7 @@ program
                 // 检查是否是 key=value 格式
                 const hasKeyValue = queryArgs.some(a => a.includes('='));
                 if (hasKeyValue) {
-                    const firstArgKey = (tool === 'check-lua' || tool === 'check-csharp') ? 'file' : tool === 'find-tagged' ? 'tag' : 'name';
+                    const firstArgKey = (tool === 'check-lua' || tool === 'check-csharp' || tool === 'find-deps') ? 'file' : tool === 'find-tagged' ? 'tag' : 'name';
                     for (const arg of queryArgs) {
                         const eqIdx = arg.indexOf('=');
                         if (eqIdx > 0) {
@@ -770,8 +771,8 @@ program
                         }
                     }
                 } else {
-                    // check-lua/check-csharp 的第一个参数是 file，其他工具是 name
-                    const firstArgKey = (tool === 'check-lua' || tool === 'check-csharp') ? 'file' : tool === 'find-tagged' ? 'tag' : 'name';
+                    // check-lua/check-csharp/find-deps 的第一个参数是 file，其他工具是 name
+                    const firstArgKey = (tool === 'check-lua' || tool === 'check-csharp' || tool === 'find-deps') ? 'file' : tool === 'find-tagged' ? 'tag' : 'name';
                     body[firstArgKey] = queryArgs[0];
                 }
             }
@@ -968,6 +969,43 @@ function formatQueryResult(tool: string, result: unknown): void {
                 if (t.snippet) console.log(`    ${t.snippet.replace(/\n/g, '\n    ')}`);
             }
             console.log(`\n${data?.count || 0} class(es) found`);
+            break;
+        }
+
+        case 'find-deps': {
+            console.log(`File: ${data?.file} [${data?.language}]`);
+            const requires = data?.deps?.luaRequires || [];
+            if (requires.length > 0) {
+                console.log(`\nLua requires (${requires.length}):`);
+                for (const r of requires) {
+                    const resolved = r.resolvedFile ? ` → ${r.resolvedFile}` : ' (unresolved)';
+                    console.log(`  L${r.line}: require("${r.module}")${resolved}`);
+                }
+            }
+            const usings = data?.deps?.csharpUsings || [];
+            if (usings.length > 0) {
+                console.log(`\nC# usings (${usings.length}):`);
+                for (const u of usings) {
+                    console.log(`  L${u.line}: using ${u.namespace};`);
+                }
+            }
+            const crossLang = data?.deps?.crossLangDeps || [];
+            if (crossLang.length > 0) {
+                console.log(`\nCross-language deps (${crossLang.length}):`);
+                for (const c of crossLang) {
+                    const alias = c.luaAlias ? ` (via ${c.luaAlias})` : '';
+                    console.log(`  ${c.csharpFqn}${alias}`);
+                }
+            }
+            const requiredBy = data?.dependents?.luaRequiredBy || [];
+            if (requiredBy.length > 0) {
+                console.log(`\nRequired by (${requiredBy.length}):`);
+                for (const r of requiredBy.slice(0, 30)) {
+                    console.log(`  ${r.file}:${r.line}`);
+                    if (r.snippet) console.log(`    ${r.snippet.replace(/\n/g, '\n    ')}`);
+                }
+                if (requiredBy.length > 30) console.log(`  ... ${requiredBy.length - 30} more`);
+            }
             break;
         }
 

@@ -692,3 +692,302 @@ describe('findTaggedClasses', () => {
         expect(results.length).toBeLessThanOrEqual(3);
     });
 });
+
+describe('findFileDeps', () => {
+    let tmpDir: string;
+    let dbPath: string;
+    let cache: CacheManager;
+    let service: QueryService;
+
+    beforeEach(async () => {
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'csg-deps-'));
+        dbPath = path.join(tmpDir, 'test.db');
+        cache = new CacheManager(dbPath);
+        const mockLsp = {
+            getClientForFile: vi.fn().mockReturnValue({ state: 'ready' }),
+            getClientForLanguage: vi.fn().mockReturnValue({ state: 'ready' }),
+            getStatus: vi.fn().mockReturnValue({ csharp: { state: 'ready' }, lua: { state: 'ready' }, allReady: true }),
+            getLspStatusForMcp: vi.fn().mockReturnValue({}),
+        } as any;
+        service = new QueryService(mockLsp, cache, tmpDir);
+    });
+
+    afterEach(async () => {
+        cache.close();
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    describe('Lua require extraction', () => {
+        it('extracts require with double quotes', () => {
+            const content = 'local M = require("games.systems.GuideManager")\n';
+            const results = service.extractLuaRequires(content, 'test.lua');
+            expect(results).toHaveLength(1);
+            expect(results[0].module).toBe('games.systems.GuideManager');
+            expect(results[0].line).toBe(1);
+        });
+
+        it('extracts require with single quotes', () => {
+            const content = "local M = require('ui.base.PageBase')\n";
+            const results = service.extractLuaRequires(content, 'test.lua');
+            expect(results).toHaveLength(1);
+            expect(results[0].module).toBe('ui.base.PageBase');
+        });
+
+        it('extracts require with spaces around parentheses', () => {
+            const content = 'local M = require( "utils.Helper" )\n';
+            const results = service.extractLuaRequires(content, 'test.lua');
+            expect(results).toHaveLength(1);
+            expect(results[0].module).toBe('utils.Helper');
+        });
+
+        it('extracts multiple requires', () => {
+            const content = [
+                'local A = require("mod.A")',
+                'local B = require("mod.B")',
+                '-- local C = require("mod.C")',
+                'local D = require("mod.D")',
+            ].join('\n');
+            const results = service.extractLuaRequires(content, 'test.lua');
+            // Note: the commented-out require is still matched by regex (not a real parser)
+            expect(results.length).toBeGreaterThanOrEqual(3);
+            expect(results[0].module).toBe('mod.A');
+            expect(results[0].line).toBe(1);
+            expect(results[1].module).toBe('mod.B');
+            expect(results[1].line).toBe(2);
+        });
+
+        it('returns empty for file without requires', () => {
+            const content = 'local x = 1\nprint("hello")\n';
+            const results = service.extractLuaRequires(content, 'test.lua');
+            expect(results).toHaveLength(0);
+        });
+    });
+
+    describe('Lua require path resolution', () => {
+        it('resolves require path when file exists', async () => {
+            // Create the target file
+            const modDir = path.join(tmpDir, 'games', 'systems');
+            fs.mkdirSync(modDir, { recursive: true });
+            fs.writeFileSync(path.join(modDir, 'GuideManager.lua'), 'return {}');
+
+            const content = 'local M = require("games.systems.GuideManager")\n';
+            const results = service.extractLuaRequires(content, 'test.lua');
+            expect(results).toHaveLength(1);
+            expect(results[0].resolvedFile).toBe('games/systems/GuideManager.lua');
+        });
+
+        it('resolves require path under Lua/ directory', async () => {
+            const luaDir = path.join(tmpDir, 'Lua', 'utils');
+            fs.mkdirSync(luaDir, { recursive: true });
+            fs.writeFileSync(path.join(luaDir, 'Helper.lua'), 'return {}');
+
+            const content = 'local H = require("utils.Helper")\n';
+            const results = service.extractLuaRequires(content, 'test.lua');
+            expect(results).toHaveLength(1);
+            expect(results[0].resolvedFile).toBe('Lua/utils/Helper.lua');
+        });
+
+        it('returns null for unresolved require path', () => {
+            const content = 'local M = require("nonexistent.Module")\n';
+            const results = service.extractLuaRequires(content, 'test.lua');
+            expect(results).toHaveLength(1);
+            expect(results[0].resolvedFile).toBeNull();
+        });
+    });
+
+    describe('C# using extraction', () => {
+        it('extracts simple using statements', () => {
+            const content = [
+                'using System;',
+                'using System.Collections.Generic;',
+                'using UnityEngine;',
+                '',
+                'namespace Game {',
+            ].join('\n');
+            const results = service.extractCsharpUsings(content);
+            expect(results).toHaveLength(3);
+            expect(results[0]).toEqual({ namespace: 'System', line: 1 });
+            expect(results[1]).toEqual({ namespace: 'System.Collections.Generic', line: 2 });
+            expect(results[2]).toEqual({ namespace: 'UnityEngine', line: 3 });
+        });
+
+        it('excludes using static', () => {
+            const content = [
+                'using System;',
+                'using static System.Math;',
+                'using UnityEngine;',
+            ].join('\n');
+            const results = service.extractCsharpUsings(content);
+            expect(results).toHaveLength(2);
+            expect(results.map(r => r.namespace)).toEqual(['System', 'UnityEngine']);
+        });
+
+        it('excludes using alias', () => {
+            const content = [
+                'using System;',
+                'using Vec3 = UnityEngine.Vector3;',
+                'using UnityEngine;',
+            ].join('\n');
+            const results = service.extractCsharpUsings(content);
+            expect(results).toHaveLength(2);
+            expect(results.map(r => r.namespace)).toEqual(['System', 'UnityEngine']);
+        });
+
+        it('returns empty for file without usings', () => {
+            const content = 'namespace Game {\n    class Foo { }\n}\n';
+            const results = service.extractCsharpUsings(content);
+            expect(results).toHaveLength(0);
+        });
+    });
+
+    describe('Lua reverse dependency (dependents)', () => {
+        it('finds files that require the target file', async () => {
+            // Create target module
+            const modDir = path.join(tmpDir, 'games');
+            fs.mkdirSync(modDir, { recursive: true });
+            fs.writeFileSync(path.join(modDir, 'Target.lua'), 'return {}');
+
+            // Create files that require it
+            fs.writeFileSync(path.join(tmpDir, 'a.lua'),
+                'local T = require("games.Target")\nprint(T)\n');
+            fs.writeFileSync(path.join(tmpDir, 'b.lua'),
+                'local other = require("games.Target")\n');
+            fs.writeFileSync(path.join(tmpDir, 'c.lua'),
+                'local x = 1\n');
+
+            const result = await service.findFileDeps('games/Target.lua', 'dependents');
+            expect(result.dependents.luaRequiredBy.length).toBe(2);
+            const files = result.dependents.luaRequiredBy.map(r => r.file).sort();
+            expect(files).toEqual(['a.lua', 'b.lua']);
+        });
+
+        it('does not include the target file itself', async () => {
+            // Create a file that requires itself (unusual but possible)
+            fs.writeFileSync(path.join(tmpDir, 'self.lua'),
+                'local M = require("self")\nreturn M\n');
+
+            const result = await service.findFileDeps('self.lua', 'dependents');
+            expect(result.dependents.luaRequiredBy).toHaveLength(0);
+        });
+    });
+
+    describe('cross-language dependencies', () => {
+        it('queries xlua_mappings for Lua file', async () => {
+            // Create the Lua file on disk (required for findFileDeps to proceed)
+            const luaDir = path.join(tmpDir, 'Lua', 'game');
+            fs.mkdirSync(luaDir, { recursive: true });
+            fs.writeFileSync(path.join(luaDir, 'init.lua'), 'local M = {}\nreturn M\n');
+
+            // Insert test xlua mappings
+            cache.db.prepare(`
+                INSERT INTO xlua_mappings (lua_call_pattern, lua_file, lua_line, csharp_fqn, lua_file_hash, status)
+                VALUES (?, ?, ?, ?, ?, ?)
+            `).run('CS.Game.ItemManager', 'Lua/game/init.lua', 10, 'Game.ItemManager', 'abc', 'verified');
+
+            cache.db.prepare(`
+                INSERT INTO xlua_mappings (lua_call_pattern, lua_file, lua_line, csharp_fqn, lua_file_hash, status)
+                VALUES (?, ?, ?, ?, ?, ?)
+            `).run('GameHelper', 'Lua/game/init.lua', 20, 'Game.Helpers.GameHelper', 'abc', 'verified');
+
+            const result = await service.findFileDeps('Lua/game/init.lua', 'deps');
+            expect(result.deps.crossLangDeps).toHaveLength(2);
+            const fqns = result.deps.crossLangDeps.map(c => c.csharpFqn).sort();
+            expect(fqns).toEqual(['Game.Helpers.GameHelper', 'Game.ItemManager']);
+        });
+
+        it('returns empty cross-lang deps for C# files', async () => {
+            fs.writeFileSync(path.join(tmpDir, 'Test.cs'),
+                'using System;\nnamespace Game { class Test { } }\n');
+
+            const result = await service.findFileDeps('Test.cs', 'deps');
+            expect(result.deps.crossLangDeps).toHaveLength(0);
+            expect(result.language).toBe('csharp');
+        });
+    });
+
+    describe('findFileDeps — full integration', () => {
+        it('returns both deps and dependents for Lua file', async () => {
+            // Create target Lua file with requires
+            const gamesDir = path.join(tmpDir, 'games');
+            fs.mkdirSync(gamesDir, { recursive: true });
+            fs.writeFileSync(path.join(gamesDir, 'Manager.lua'), [
+                'local Base = require("games.Base")',
+                'local Utils = require("utils.Helper")',
+                'local M = {}',
+                'return M',
+            ].join('\n'));
+
+            // Create the required Base module
+            fs.writeFileSync(path.join(gamesDir, 'Base.lua'), 'return {}');
+
+            // Create a file that depends on Manager
+            fs.writeFileSync(path.join(tmpDir, 'main.lua'),
+                'local Mgr = require("games.Manager")\nMgr:init()\n');
+
+            const result = await service.findFileDeps('games/Manager.lua', 'both');
+            expect(result.file).toBe('games/Manager.lua');
+            expect(result.language).toBe('lua');
+
+            // Should have 2 requires
+            expect(result.deps.luaRequires).toHaveLength(2);
+            expect(result.deps.luaRequires[0].module).toBe('games.Base');
+            expect(result.deps.luaRequires[0].resolvedFile).toBe('games/Base.lua');
+            expect(result.deps.luaRequires[1].module).toBe('utils.Helper');
+            expect(result.deps.luaRequires[1].resolvedFile).toBeNull(); // doesn't exist
+
+            // Should be required by main.lua
+            expect(result.dependents.luaRequiredBy).toHaveLength(1);
+            expect(result.dependents.luaRequiredBy[0].file).toBe('main.lua');
+        });
+
+        it('returns usings for C# file', async () => {
+            fs.writeFileSync(path.join(tmpDir, 'Player.cs'), [
+                'using System;',
+                'using System.Collections.Generic;',
+                'using UnityEngine;',
+                '',
+                'namespace Game {',
+                '    public class Player : MonoBehaviour {',
+                '    }',
+                '}',
+            ].join('\n'));
+
+            const result = await service.findFileDeps('Player.cs', 'deps');
+            expect(result.language).toBe('csharp');
+            expect(result.deps.csharpUsings).toHaveLength(3);
+            expect(result.deps.csharpUsings.map(u => u.namespace)).toEqual([
+                'System', 'System.Collections.Generic', 'UnityEngine',
+            ]);
+        });
+
+        it('returns empty result for nonexistent file', async () => {
+            const result = await service.findFileDeps('nonexistent.lua', 'both');
+            expect(result.deps.luaRequires).toHaveLength(0);
+            expect(result.dependents.luaRequiredBy).toHaveLength(0);
+        });
+
+        it('respects direction=deps (no dependents query)', async () => {
+            fs.writeFileSync(path.join(tmpDir, 'mod.lua'),
+                'local A = require("other")\nreturn {}\n');
+            fs.writeFileSync(path.join(tmpDir, 'user.lua'),
+                'local M = require("mod")\n');
+
+            const result = await service.findFileDeps('mod.lua', 'deps');
+            expect(result.deps.luaRequires).toHaveLength(1);
+            // dependents should be empty since direction=deps
+            expect(result.dependents.luaRequiredBy).toHaveLength(0);
+        });
+
+        it('respects direction=dependents (no deps query)', async () => {
+            fs.writeFileSync(path.join(tmpDir, 'mod.lua'),
+                'local A = require("other")\nreturn {}\n');
+            fs.writeFileSync(path.join(tmpDir, 'user.lua'),
+                'local M = require("mod")\n');
+
+            const result = await service.findFileDeps('mod.lua', 'dependents');
+            // deps should be empty since direction=dependents
+            expect(result.deps.luaRequires).toHaveLength(0);
+            expect(result.dependents.luaRequiredBy).toHaveLength(1);
+        });
+    });
+});

@@ -8,7 +8,7 @@ import { LspManager } from '../lsp/lsp-manager.js';
 import { CacheManager } from '../cache/cache-manager.js';
 import { successResponse, errorResponse, type McpToolResponse } from '../utils/mcp-response.js';
 import { readSnippet, clearSnippetCache } from '../utils/snippet.js';
-import type { CallChainNode, TaggedClassResult } from '../core/query-service.js';
+import type { CallChainNode, TaggedClassResult, FileDepsResult } from '../core/query-service.js';
 import type { AssetIndex } from '../core/asset-index.js';
 import type { ProtocolIndex } from '../core/protocol-index.js';
 
@@ -532,6 +532,49 @@ export async function handleFindTagged(
                 snippet: readSnippet(ctx.workspaceRoot, r.file, r.line, 1),
             })),
             count: results.length,
+        });
+    } finally {
+        clearSnippetCache();
+    }
+}
+
+export async function handleFileDeps(
+    ctx: QueryContext,
+    args: { file: string; direction?: string },
+): Promise<McpToolResponse> {
+    try {
+        const direction = (args.direction || 'both') as 'deps' | 'dependents' | 'both';
+        const result = await ctx.queryService.findFileDeps(args.file, direction);
+
+        const hasContent =
+            result.deps.luaRequires.length > 0 ||
+            result.deps.csharpUsings.length > 0 ||
+            result.deps.crossLangDeps.length > 0 ||
+            result.dependents.luaRequiredBy.length > 0;
+
+        if (!hasContent) {
+            const lspStatus = ctx.lspManager.getLspStatusForMcp();
+            return errorResponse(
+                'NO_MATCH',
+                `No dependencies found for: ${args.file}`,
+                lspStatus,
+            );
+        }
+
+        return successResponse({
+            file: result.file,
+            language: result.language,
+            deps: {
+                luaRequires: result.deps.luaRequires,
+                csharpUsings: result.deps.csharpUsings,
+                crossLangDeps: result.deps.crossLangDeps,
+            },
+            dependents: {
+                luaRequiredBy: result.dependents.luaRequiredBy.map((r, i) => ({
+                    ...r,
+                    ...(i < 50 ? { snippet: readSnippet(ctx.workspaceRoot, r.file, r.line, 1) } : {}),
+                })),
+            },
         });
     } finally {
         clearSnippetCache();

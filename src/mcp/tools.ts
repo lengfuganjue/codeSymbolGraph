@@ -21,6 +21,7 @@ import {
     handleCheckLua,
     handleCheckCsharp,
     handleFindTagged,
+    handleFileDeps,
 } from '../daemon/query-handler.js';
 import type { AssetIndex } from '../core/asset-index.js';
 import type { ProtocolIndex } from '../core/protocol-index.js';
@@ -264,6 +265,19 @@ export function registerTools(
         },
         async (args) => wrapTool(lspManager, indexingReady, () =>
             handleFindTagged(ctx, args),
+        ),
+    );
+
+    // ===== csg_file_deps =====
+    server.tool(
+        'csg_file_deps',
+        '查询文件的依赖关系。Lua: require 依赖 + C# 跨语言依赖 + 反向 require 查找。C#: using 命名空间。',
+        {
+            file: z.string().describe('文件相对路径（如 "Lua/games/systems/GuideManager.lua"）'),
+            direction: z.enum(['deps', 'dependents', 'both']).optional().default('both').describe('查询方向：deps=依赖了谁, dependents=被谁依赖, both=双向（默认）'),
+        },
+        async (args) => wrapTool(lspManager, indexingReady, () =>
+            handleFileDeps(ctx, args),
         ),
     );
 }
