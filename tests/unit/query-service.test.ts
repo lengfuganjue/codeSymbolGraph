@@ -1437,3 +1437,99 @@ describe('checkDanglingAliases', () => {
         expect(result.danglingCount).toBeLessThanOrEqual(3);
     });
 });
+
+describe('confidence scoring', () => {
+    let dbPath: string;
+    let cache: CacheManager;
+    let lspManager: ReturnType<typeof createMockLspManager>;
+    let service: QueryService;
+
+    beforeEach(() => {
+        dbPath = makeTempDb();
+        cache = new CacheManager(dbPath);
+        lspManager = createMockLspManager();
+        service = new QueryService(lspManager, cache, 'C:\\workspace\\project');
+    });
+
+    afterEach(() => {
+        cache.close();
+        try { fs.unlinkSync(dbPath); } catch {}
+        try { fs.rmdirSync(path.dirname(dbPath)); } catch {}
+    });
+
+    describe('findReferences confidence', () => {
+        it('should mark LSP references as exact confidence', async () => {
+            cache.cacheSymbols('hash1', [makeSymbol()]);
+
+            lspManager._mockClient.references.mockResolvedValue([
+                {
+                    uri: 'file:///C:/workspace/project/Assets/Scripts/GameManager.cs',
+                    range: { start: { line: 30, character: 10 }, end: { line: 30, character: 16 } },
+                },
+                {
+                    uri: 'file:///C:/workspace/project/Assets/Scripts/UI.cs',
+                    range: { start: { line: 5, character: 2 }, end: { line: 5, character: 8 } },
+                },
+            ]);
+
+            const result = await service.findReferences({ name: 'Player' });
+            expect(result.count).toBe(2);
+            for (const ref of result.references) {
+                expect(ref.confidence).toBe('exact');
+            }
+        });
+
+        it('should not have confidence on cached references', async () => {
+            cache.cacheSymbols('hash1', [makeSymbol()]);
+            cache.cacheReferences(
+                'Game.Player',
+                { file: 'Player.cs', line: 10, char: 0 },
+                [
+                    { ref_file: 'GameManager.cs', ref_line: 20, ref_char: 5, cached_at: Date.now() },
+                ],
+            );
+
+            const result = await service.findReferences({ name: 'Player' });
+            expect(result.source).toBe('cache');
+            // Cached results don't have confidence (they're from a previous query)
+            expect(result.references[0].confidence).toBeUndefined();
+        });
+    });
+
+    describe('findCallChain confidence', () => {
+        it('should mark references-based callers as high confidence', async () => {
+            cache.cacheSymbols('hash1', [makeSymbol({
+                name: 'Attack',
+                fqn: 'Game.Player.Attack',
+                kind: 6,
+                file_path: 'Assets/Scripts/Player.cs',
+                range_start_line: 30,
+                range_start_char: 8,
+            })]);
+
+            lspManager._mockClient.references.mockResolvedValue([
+                {
+                    uri: 'file:///C:/workspace/project/Assets/Scripts/Combat.cs',
+                    range: { start: { line: 50, character: 12 }, end: { line: 50, character: 18 } },
+                },
+            ]);
+
+            lspManager._mockClient.documentSymbol.mockResolvedValue([{
+                name: 'ProcessCombat',
+                kind: 6,
+                range: { start: { line: 40, character: 0 }, end: { line: 60, character: 1 } },
+                selectionRange: { start: { line: 40, character: 4 }, end: { line: 40, character: 17 } },
+            }]);
+
+            const result = await service.findCallChain({
+                name: 'Attack',
+                direction: 'incoming',
+                maxDepth: 1,
+            });
+
+            expect(result.incoming).toHaveLength(1);
+            expect(result.incoming[0].name).toBe('ProcessCombat');
+            expect(result.incoming[0].confidence).toBe('high');
+        });
+    });
+});

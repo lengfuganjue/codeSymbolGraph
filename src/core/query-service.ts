@@ -444,10 +444,11 @@ export class QueryService {
             }
         }
 
-        let results = lspRefs.map(ref => ({
+        let results: ReferenceItem[] = lspRefs.map(ref => ({
             file: uriToRelative(this.workspaceRoot, ref.uri),
             line: ref.range.start.line + 1,
             character: ref.range.start.character,
+            confidence: 'exact' as Confidence,
         }));
 
         // Lua grep fallback：LuaLS 对全局变量/workspace 外文件 references 常返回空或超时
@@ -456,7 +457,7 @@ export class QueryService {
             const grepResults = await this.grepLuaReferences(symbolName);
             if (grepResults.length > 0) {
                 console.error(`[CSG] references: Lua grep fallback found ${grepResults.length} results for "${symbolName}"`);
-                results = grepResults;
+                results = grepResults.map(r => ({ ...r, confidence: 'medium' as Confidence }));
             }
         }
 
@@ -473,7 +474,7 @@ export class QueryService {
                     for (const gr of grepResults) {
                         const key = `${gr.file}:${gr.line}`;
                         if (!seen.has(key)) {
-                            results.push(gr);
+                            results.push({ ...gr, confidence: 'medium' as Confidence });
                             seen.add(key);
                             added++;
                         }
@@ -1622,6 +1623,7 @@ export class QueryService {
                 file: callerFile,
                 line: callerLine,
                 children: [],
+                confidence: 'exact',
             };
 
             node.children = await this.findIncomingCallersViaCallHierarchy(
@@ -1679,6 +1681,7 @@ export class QueryService {
                     file: calleeFile,
                     line: calleeLine,
                     children: [],
+                    confidence: 'exact',
                 };
 
                 node.children = await this.findOutgoingCallsViaCallHierarchy(
@@ -1765,6 +1768,7 @@ export class QueryService {
                                 file: refFile,
                                 line: enclosing.range.start.line + 1,
                                 children: [],
+                                confidence: 'high',
                             });
                         }
                     } else {
@@ -1864,6 +1868,11 @@ export class QueryService {
         return undefined;
     }
 
+    /** confidence 优先级排序（用于合并时取更高置信度） */
+    private static readonly CONFIDENCE_RANK: Record<string, number> = {
+        exact: 0, high: 1, medium: 2, low: 3,
+    };
+
     /** 合并两组 CallChainNode，按 file:line 去重 */
     private mergeCallChainNodes(a: CallChainNode[], b: CallChainNode[]): CallChainNode[] {
         const seen = new Map<string, CallChainNode>();
@@ -1872,9 +1881,11 @@ export class QueryService {
             if (!seen.has(key)) {
                 seen.set(key, node);
             } else {
-                // 保留 children 更多的那个
                 const existing = seen.get(key)!;
-                if (node.children.length > existing.children.length) {
+                // 保留 confidence 更高的，或 children 更多的
+                const existingRank = QueryService.CONFIDENCE_RANK[existing.confidence ?? 'medium'] ?? 2;
+                const nodeRank = QueryService.CONFIDENCE_RANK[node.confidence ?? 'medium'] ?? 2;
+                if (nodeRank < existingRank || (nodeRank === existingRank && node.children.length > existing.children.length)) {
                     seen.set(key, node);
                 }
             }
@@ -1962,6 +1973,7 @@ export class QueryService {
                             file: uriToRelative(this.workspaceRoot, ref.uri),
                             line: ref.range.start.line + 1,
                             character: ref.range.start.character,
+                            confidence: 'high' as Confidence,
                         })),
                         count: lspRefs.length,
                         source: 'lsp',
@@ -1976,7 +1988,7 @@ export class QueryService {
         console.error(`[CSG] references: grep fallback for "${symbolName}": ${grepResults.length} results`);
         return {
             symbolFqn: symbolName,
-            references: grepResults,
+            references: grepResults.map(r => ({ ...r, confidence: 'medium' as Confidence })),
             count: grepResults.length,
             source: 'grep',
         };
@@ -2077,6 +2089,7 @@ export class QueryService {
                                 file: refFile,
                                 line: enclosing.range.start.line + 1,
                                 children: [],
+                                confidence: 'medium',
                             });
                         }
                     }
@@ -2296,9 +2309,19 @@ export interface DefinitionResult extends ResolvedSymbol {
     latencyMs: number;
 }
 
+/** 结果置信度等级 */
+export type Confidence = 'exact' | 'high' | 'medium' | 'low';
+
+export interface ReferenceItem {
+    file: string;
+    line: number;
+    character: number;
+    confidence?: Confidence;
+}
+
 export interface ReferenceResult {
     symbolFqn: string;
-    references: { file: string; line: number; character: number }[];
+    references: ReferenceItem[];
     count: number;
     source: 'cache' | 'lsp' | 'grep';
     error?: string;
@@ -2317,6 +2340,7 @@ export interface CallChainNode {
     file: string;
     line: number;
     children: CallChainNode[];
+    confidence?: Confidence;
 }
 
 export interface HierarchyResult {

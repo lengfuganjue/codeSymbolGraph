@@ -8,7 +8,7 @@ import { LspManager } from '../lsp/lsp-manager.js';
 import { CacheManager } from '../cache/cache-manager.js';
 import { successResponse, errorResponse, type McpToolResponse } from '../utils/mcp-response.js';
 import { readSnippet, clearSnippetCache } from '../utils/snippet.js';
-import type { CallChainNode, TaggedClassResult, FileDepsResult, RenamePreview, DanglingAliasResult } from '../core/query-service.js';
+import type { CallChainNode, TaggedClassResult, FileDepsResult, RenamePreview, DanglingAliasResult, Confidence } from '../core/query-service.js';
 import type { AssetIndex } from '../core/asset-index.js';
 import type { ProtocolIndex } from '../core/protocol-index.js';
 
@@ -62,6 +62,7 @@ export async function handleFindDefinition(
 
 type CrossLangCallSite = {
     file: string; line: number; callerFqn?: string; pattern: string; status: string;
+    confidence?: Confidence;
 };
 
 /**
@@ -74,7 +75,10 @@ async function buildCrossLangSites(
     queryService: QueryContext['queryService'],
 ): Promise<CrossLangCallSite[]> {
     const sites = xluaResult?.lua?.callSites ?? [];
-    if (sites.length > 0 || !fqn) return sites;
+    if (sites.length > 0 || !fqn) {
+        // xlua_mappings 直接匹配的 → 'medium'
+        return sites.map(s => ({ ...s, confidence: (s.confidence ?? 'medium') as Confidence }));
+    }
 
     const memberName = fqn.split('.').pop();
     if (!memberName || !/^[A-Za-z_]\w*$/.test(memberName)) return [];
@@ -85,6 +89,7 @@ async function buildCrossLangSites(
         line: h.line,
         pattern: `[:.] ${memberName}(`,
         status: 'lua_grep',
+        confidence: 'low' as Confidence,
     }));
 }
 
@@ -117,6 +122,7 @@ export async function handleFindReferences(
         const refs = filteredRefs.map((r, i) => ({
             file: r.file,
             line: r.line,
+            ...(r.confidence ? { confidence: r.confidence } : {}),
             ...(i < 50 ? { snippet: readSnippet(ctx.workspaceRoot, r.file, r.line, 1) } : {}),
         }));
 
@@ -207,6 +213,7 @@ export async function handleCrossLang(
 
         const callSites = result.lua.callSites.map((c, i) => ({
             ...c,
+            confidence: ((c as any).confidence ?? 'medium') as Confidence,
             ...(i < 50 ? { snippet: readSnippet(ctx.workspaceRoot, c.file, c.line, 1) } : {}),
         }));
 
