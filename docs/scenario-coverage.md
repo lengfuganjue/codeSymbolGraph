@@ -222,14 +222,14 @@
 | 9 | **`csg_check_aliases`：XLua 别名悬空检测** | ✓ 已完成 |
 | 10 | **`[Hotfix]` 属性索引** | ✓ 已由 `csg_find_tagged` 覆盖（`tag=Hotfix`） |
 
-### P3 — 长期 / 探索性
+### P3 — 已完成 ✓
 
-| # | 改进项 | 备注 |
+| # | 改进项 | 状态 |
 |---|--------|------|
-| 11 | 带语义过滤的 `csg_search` | 区分调用/定义/注释中的匹配 |
-| 12 | 循环依赖检测（Lua require / C# 互依） | 需完整依赖图支持 |
-| 13 | 资源加载反向查（哪些代码加载此资源） | 需要解析 Resources.Load / Addressable 等 |
-| 14 | C# 字段读写流分析 | 接近数据流分析，复杂度较高 |
+| 11 | **`csg_search`：带语义过滤的搜索**（区分 call/definition/comment/string） | ✓ 已完成 |
+| 12 | **`csg_check_cycles`：循环依赖检测**（Lua require DFS 环检测） | ✓ 已完成 |
+| 13 | **资源加载反向查**（csg_find_asset direction=reverse） | ✓ 已完成 |
+| 14 | **`csg_field_access`：字段读写分析**（区分 read/write，启发式正则） | ✓ 已完成 |
 
 ---
 
