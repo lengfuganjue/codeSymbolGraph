@@ -213,14 +213,14 @@
 | 5 | **MonoBehaviour / `[LuaCallCSharp]` 类扫描** | 新增 `csg_find_tagged` 工具（按 attribute/基类查询 C# 类） | ✓ 已完成 |
 | 6 | **`csg_rename_preview`：重命名影响预览** | 新增工具（LSP rename + fallback + Lua grep 跨语言） | ✓ 已完成 |
 
-### P2 — 中等价值，需较多工作
+### P2 — 已完成 ✓
 
-| # | 改进项 | 核心价值 |
-|---|--------|---------|
-| 7 | **Lua 变量类型推断**（赋值链） | 消除 GetComponent 短名盲区，扩展跨语言覆盖 |
-| 8 | **结果置信度评分系统化** | 让 Claude 区分"确定"和"可能"，减少误判 |
-| 9 | **XLua 别名悬空检测** | 检测 Lua 中指向已删除 C# 类的别名 |
-| 10 | **`[Hotfix]` 属性索引** | 热更新代码的专项查询能力 |
+| # | 改进项 | 状态 |
+|---|--------|------|
+| 7 | **GetComponent 短名 FQN 解析**（workspaceSymbol 唯一匹配） | ✓ 已完成 |
+| 8 | **结果置信度评分系统**（exact/high/medium/low） | ✓ 已完成 |
+| 9 | **`csg_check_aliases`：XLua 别名悬空检测** | ✓ 已完成 |
+| 10 | **`[Hotfix]` 属性索引** | ✓ 已由 `csg_find_tagged` 覆盖（`tag=Hotfix`） |
 
 ### P3 — 长期 / 探索性
 
