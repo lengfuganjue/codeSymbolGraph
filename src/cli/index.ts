@@ -739,6 +739,7 @@ program
             'find-tagged': { endpoint: '/api/find-tagged', method: 'POST' },
             'find-deps': { endpoint: '/api/file-deps', method: 'POST' },
             'rename-preview': { endpoint: '/api/rename-preview', method: 'POST' },
+            'check-aliases': { endpoint: '/api/check-aliases', method: 'POST' },
         };
 
         const mapping = toolMap[tool];
@@ -755,7 +756,7 @@ program
                 // 检查是否是 key=value 格式
                 const hasKeyValue = queryArgs.some(a => a.includes('='));
                 if (hasKeyValue) {
-                    const firstArgKey = (tool === 'check-lua' || tool === 'check-csharp' || tool === 'find-deps') ? 'file' : tool === 'find-tagged' ? 'tag' : 'name';
+                    const firstArgKey = (tool === 'check-lua' || tool === 'check-csharp' || tool === 'find-deps' || tool === 'check-aliases') ? 'file' : tool === 'find-tagged' ? 'tag' : 'name';
                     for (const arg of queryArgs) {
                         const eqIdx = arg.indexOf('=');
                         if (eqIdx > 0) {
@@ -772,8 +773,8 @@ program
                         }
                     }
                 } else {
-                    // check-lua/check-csharp/find-deps 的第一个参数是 file，其他工具是 name
-                    const firstArgKey = (tool === 'check-lua' || tool === 'check-csharp' || tool === 'find-deps') ? 'file' : tool === 'find-tagged' ? 'tag' : 'name';
+                    // check-lua/check-csharp/find-deps/check-aliases 的第一个参数是 file，其他工具是 name
+                    const firstArgKey = (tool === 'check-lua' || tool === 'check-csharp' || tool === 'find-deps' || tool === 'check-aliases') ? 'file' : tool === 'find-tagged' ? 'tag' : 'name';
                     body[firstArgKey] = queryArgs[0];
                 }
             }
@@ -1029,6 +1030,20 @@ function formatQueryResult(tool: string, result: unknown): void {
                 console.log(`\nWarnings:`);
                 for (const w of rpWarnings) {
                     console.log(`  ⚠ ${w}`);
+                }
+            }
+            break;
+        }
+
+        case 'check-aliases': {
+            console.log(`Checked: ${data?.totalChecked || 0} aliases`);
+            console.log(`Dangling: ${data?.danglingCount || 0}`);
+            const dangling = data?.danglingAliases || [];
+            if (dangling.length > 0) {
+                console.log(`\nDangling aliases:`);
+                for (const d of dangling) {
+                    console.log(`  ${d.aliasName} -> ${d.csharpFqn}`);
+                    console.log(`    ${d.luaFile}:${d.luaLine} (${d.reason})`);
                 }
             }
             break;

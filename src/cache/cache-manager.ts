@@ -218,6 +218,36 @@ export class CacheManager {
         return createHash('sha256').update(content).digest('hex').substring(0, 16);
     }
 
+    getAllAliases(luaFile?: string): Array<{
+        alias_name: string;
+        original_cs_pattern: string;
+        lua_file: string;
+        lua_line: number;
+    }> {
+        if (luaFile) {
+            return this._db.prepare(
+                `SELECT alias_name, original_cs_pattern, alias_file AS lua_file, alias_line AS lua_line
+                 FROM lua_aliases WHERE alias_file = ?
+                 ORDER BY alias_file, alias_line`,
+            ).all(luaFile) as Array<{
+                alias_name: string;
+                original_cs_pattern: string;
+                lua_file: string;
+                lua_line: number;
+            }>;
+        }
+        return this._db.prepare(
+            `SELECT alias_name, original_cs_pattern, alias_file AS lua_file, alias_line AS lua_line
+             FROM lua_aliases
+             ORDER BY alias_file, alias_line`,
+        ).all() as Array<{
+            alias_name: string;
+            original_cs_pattern: string;
+            lua_file: string;
+            lua_line: number;
+        }>;
+    }
+
     getStats(): CacheStats {
         const symbolCount = (this._db.prepare(
             'SELECT COUNT(*) as c FROM symbol_cache WHERE stale = 0',

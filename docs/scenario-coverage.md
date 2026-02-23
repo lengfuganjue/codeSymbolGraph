@@ -205,14 +205,13 @@
 | — | **Unity csproj DLL 引用提取** | `extractReferences` + `isUnityProject` 新版检测 | ✓ 已完成 |
 | — | **.NET 9 兼容性修复** | 发现并记录 .NET 10 下 Roslyn API 静默失败问题 | ✓ 已完成 |
 
-### P1 — 高价值、中等难度
+### P1 — 已完成 ✓
 
-| # | 改进项 | 新增工具/改动 | 核心价值 |
-|---|--------|-------------|---------|
-| 3 | **`csg_file_deps`：文件依赖图** | 新增工具 + `file_deps` 索引表 | AI 理解项目模块结构的基础，grep 完全无法 |
-| 4 | **Lua require 依赖解析** | `fullScan` 扫描 + 集成到 `csg_file_deps` | Lua 模块间关系目前完全缺失 |
-| 5 | **MonoBehaviour / `[LuaCallCSharp]` 类扫描** | 新增 `csg_find_tagged` + `cs_attributes` 表 | Unity 项目高频查询，grep 有误报 |
-| 6 | **`csg_rename_preview`：重命名影响预览** | 新增工具，组合现有能力 | 让 Claude 在重命名前看到完整改动范围 |
+| # | 改进项 | 新增工具/改动 | 状态 |
+|---|--------|-------------|------|
+| 3+4 | **`csg_file_deps`：文件依赖图 + Lua require 解析** | 新增工具（Lua require + C# using + XLua 跨语言 + 反向依赖） | ✓ 已完成 |
+| 5 | **MonoBehaviour / `[LuaCallCSharp]` 类扫描** | 新增 `csg_find_tagged` 工具（按 attribute/基类查询 C# 类） | ✓ 已完成 |
+| 6 | **`csg_rename_preview`：重命名影响预览** | 新增工具（LSP rename + fallback + Lua grep 跨语言） | ✓ 已完成 |
 
 ### P2 — 中等价值，需较多工作
 

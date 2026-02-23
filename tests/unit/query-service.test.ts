@@ -1263,3 +1263,177 @@ describe('renamePreview', () => {
         expect(bFile!.changes[0].newText).toContain('Utility');
     });
 });
+
+describe('checkDanglingAliases', () => {
+    let dbPath: string;
+    let cache: CacheManager;
+    let lspManager: ReturnType<typeof createMockLspManager>;
+    let service: QueryService;
+
+    beforeEach(() => {
+        dbPath = makeTempDb();
+        cache = new CacheManager(dbPath);
+        lspManager = createMockLspManager();
+        service = new QueryService(lspManager, cache, '/workspace/project');
+    });
+
+    afterEach(() => {
+        cache.close();
+        try { fs.unlinkSync(dbPath); } catch {}
+        try { fs.rmdirSync(path.dirname(dbPath)); } catch {}
+    });
+
+    it('should return empty when lua_aliases table is empty', async () => {
+        const result = await service.checkDanglingAliases({});
+        expect(result.totalChecked).toBe(0);
+        expect(result.danglingCount).toBe(0);
+        expect(result.danglingAliases).toHaveLength(0);
+    });
+
+    it('should return danglingCount=0 when all aliases exist', async () => {
+        // Insert aliases
+        cache.db.prepare(
+            `INSERT INTO lua_aliases (alias_name, alias_file, alias_line, original_cs_pattern, file_hash)
+             VALUES (?, ?, ?, ?, ?)`,
+        ).run('C_Player', 'Lua/game/init.lua', 5, 'CS.Game.Player', '');
+        cache.db.prepare(
+            `INSERT INTO lua_aliases (alias_name, alias_file, alias_line, original_cs_pattern, file_hash)
+             VALUES (?, ?, ?, ?, ?)`,
+        ).run('C_Enemy', 'Lua/game/init.lua', 6, 'CS.Game.Enemy', '');
+
+        // Mock workspaceSymbol to return matching symbols for both
+        lspManager._mockClient.workspaceSymbol.mockImplementation(async (query: string) => {
+            if (query === 'Player') {
+                return [{
+                    name: 'Player',
+                    containerName: 'Game',
+                    kind: 5,
+                    location: {
+                        uri: 'file:///workspace/project/Player.cs',
+                        range: { start: { line: 0, character: 0 }, end: { line: 0, character: 6 } },
+                    },
+                }];
+            }
+            if (query === 'Enemy') {
+                return [{
+                    name: 'Enemy',
+                    containerName: 'Game',
+                    kind: 5,
+                    location: {
+                        uri: 'file:///workspace/project/Enemy.cs',
+                        range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+                    },
+                }];
+            }
+            return [];
+        });
+
+        const result = await service.checkDanglingAliases({});
+        expect(result.totalChecked).toBe(2);
+        expect(result.danglingCount).toBe(0);
+        expect(result.danglingAliases).toHaveLength(0);
+    });
+
+    it('should detect dangling aliases when C# FQN not found', async () => {
+        // Insert aliases: one exists, one does not
+        cache.db.prepare(
+            `INSERT INTO lua_aliases (alias_name, alias_file, alias_line, original_cs_pattern, file_hash)
+             VALUES (?, ?, ?, ?, ?)`,
+        ).run('C_Player', 'Lua/game/init.lua', 5, 'CS.Game.Player', '');
+        cache.db.prepare(
+            `INSERT INTO lua_aliases (alias_name, alias_file, alias_line, original_cs_pattern, file_hash)
+             VALUES (?, ?, ?, ?, ?)`,
+        ).run('C_Deleted', 'Lua/game/init.lua', 10, 'CS.Game.DeletedClass', '');
+
+        lspManager._mockClient.workspaceSymbol.mockImplementation(async (query: string) => {
+            if (query === 'Player') {
+                return [{
+                    name: 'Player',
+                    containerName: 'Game',
+                    kind: 5,
+                    location: {
+                        uri: 'file:///workspace/project/Player.cs',
+                        range: { start: { line: 0, character: 0 }, end: { line: 0, character: 6 } },
+                    },
+                }];
+            }
+            // DeletedClass returns empty
+            return [];
+        });
+
+        const result = await service.checkDanglingAliases({});
+        expect(result.totalChecked).toBe(2);
+        expect(result.danglingCount).toBe(1);
+        expect(result.danglingAliases).toHaveLength(1);
+        expect(result.danglingAliases[0].aliasName).toBe('C_Deleted');
+        expect(result.danglingAliases[0].csharpFqn).toBe('Game.DeletedClass');
+        expect(result.danglingAliases[0].luaFile).toBe('Lua/game/init.lua');
+        expect(result.danglingAliases[0].luaLine).toBe(10);
+        expect(result.danglingAliases[0].reason).toBe('C# symbol not found via workspaceSymbol');
+    });
+
+    it('should filter by file when file parameter is provided', async () => {
+        // Insert aliases in two different files
+        cache.db.prepare(
+            `INSERT INTO lua_aliases (alias_name, alias_file, alias_line, original_cs_pattern, file_hash)
+             VALUES (?, ?, ?, ?, ?)`,
+        ).run('C_Player', 'Lua/game/init.lua', 5, 'CS.Game.Player', '');
+        cache.db.prepare(
+            `INSERT INTO lua_aliases (alias_name, alias_file, alias_line, original_cs_pattern, file_hash)
+             VALUES (?, ?, ?, ?, ?)`,
+        ).run('C_Other', 'Lua/other/init.lua', 3, 'CS.Game.Other', '');
+
+        // Both not found
+        lspManager._mockClient.workspaceSymbol.mockResolvedValue([]);
+
+        const result = await service.checkDanglingAliases({ file: 'Lua/game/init.lua' });
+        expect(result.totalChecked).toBe(1);
+        expect(result.danglingCount).toBe(1);
+        expect(result.danglingAliases).toHaveLength(1);
+        expect(result.danglingAliases[0].aliasName).toBe('C_Player');
+    });
+
+    it('should deduplicate FQN queries (same FQN from multiple aliases)', async () => {
+        // Three aliases pointing to the same FQN
+        cache.db.prepare(
+            `INSERT INTO lua_aliases (alias_name, alias_file, alias_line, original_cs_pattern, file_hash)
+             VALUES (?, ?, ?, ?, ?)`,
+        ).run('C_Foo', 'Lua/a.lua', 1, 'CS.Game.Foo', '');
+        cache.db.prepare(
+            `INSERT INTO lua_aliases (alias_name, alias_file, alias_line, original_cs_pattern, file_hash)
+             VALUES (?, ?, ?, ?, ?)`,
+        ).run('C_Foo2', 'Lua/b.lua', 2, 'CS.Game.Foo', '');
+        cache.db.prepare(
+            `INSERT INTO lua_aliases (alias_name, alias_file, alias_line, original_cs_pattern, file_hash)
+             VALUES (?, ?, ?, ?, ?)`,
+        ).run('C_Foo3', 'Lua/c.lua', 3, 'CS.Game.Foo', '');
+
+        // FQN not found
+        lspManager._mockClient.workspaceSymbol.mockResolvedValue([]);
+
+        const result = await service.checkDanglingAliases({});
+        expect(result.totalChecked).toBe(3);
+        expect(result.danglingCount).toBe(3);
+
+        // workspaceSymbol should only be called once for "Foo" (deduplicated by FQN)
+        expect(lspManager._mockClient.workspaceSymbol).toHaveBeenCalledTimes(1);
+        expect(lspManager._mockClient.workspaceSymbol).toHaveBeenCalledWith('Foo');
+    });
+
+    it('should respect limit parameter', async () => {
+        // Insert 5 dangling aliases
+        for (let i = 0; i < 5; i++) {
+            cache.db.prepare(
+                `INSERT INTO lua_aliases (alias_name, alias_file, alias_line, original_cs_pattern, file_hash)
+                 VALUES (?, ?, ?, ?, ?)`,
+            ).run(`C_Missing${i}`, 'Lua/game/init.lua', i + 1, `CS.Game.Missing${i}`, '');
+        }
+
+        lspManager._mockClient.workspaceSymbol.mockResolvedValue([]);
+
+        const result = await service.checkDanglingAliases({ limit: 3 });
+        expect(result.totalChecked).toBe(5);
+        expect(result.danglingAliases.length).toBeLessThanOrEqual(3);
+        expect(result.danglingCount).toBeLessThanOrEqual(3);
+    });
+});

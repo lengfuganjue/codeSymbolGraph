@@ -8,7 +8,7 @@ import { LspManager } from '../lsp/lsp-manager.js';
 import { CacheManager } from '../cache/cache-manager.js';
 import { successResponse, errorResponse, type McpToolResponse } from '../utils/mcp-response.js';
 import { readSnippet, clearSnippetCache } from '../utils/snippet.js';
-import type { CallChainNode, TaggedClassResult, FileDepsResult, RenamePreview } from '../core/query-service.js';
+import type { CallChainNode, TaggedClassResult, FileDepsResult, RenamePreview, DanglingAliasResult } from '../core/query-service.js';
 import type { AssetIndex } from '../core/asset-index.js';
 import type { ProtocolIndex } from '../core/protocol-index.js';
 
@@ -603,6 +603,18 @@ export async function handleRenamePreview(
         new_name: args.new_name,
         file: args.file,
         line: args.line,
+    });
+
+    return successResponse(result);
+}
+
+export async function handleCheckAliases(
+    ctx: QueryContext,
+    args: { file?: string; limit?: number },
+): Promise<McpToolResponse> {
+    const result = await ctx.queryService.checkDanglingAliases({
+        file: args.file,
+        limit: args.limit,
     });
 
     return successResponse(result);

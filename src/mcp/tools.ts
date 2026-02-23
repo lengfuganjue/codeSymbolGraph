@@ -23,6 +23,7 @@ import {
     handleFindTagged,
     handleFileDeps,
     handleRenamePreview,
+    handleCheckAliases,
 } from '../daemon/query-handler.js';
 import type { AssetIndex } from '../core/asset-index.js';
 import type { ProtocolIndex } from '../core/protocol-index.js';
@@ -294,6 +295,19 @@ export function registerTools(
         },
         async (args) => wrapTool(lspManager, indexingReady, () =>
             handleRenamePreview(ctx, args),
+        ),
+    );
+
+    // ===== csg_check_aliases =====
+    server.tool(
+        'csg_check_aliases',
+        'Check for dangling XLua aliases pointing to non-existent C# types. Detects Lua aliases like "local C_Foo = CS.Game.Foo" where the C# class has been deleted or renamed.',
+        {
+            file: z.string().optional().describe('Limit check to specific Lua file'),
+            limit: z.number().optional().default(100).describe('Max results (default 100)'),
+        },
+        async (args) => wrapTool(lspManager, indexingReady, () =>
+            handleCheckAliases(ctx, args),
         ),
     );
 }

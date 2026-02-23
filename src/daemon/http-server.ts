@@ -19,6 +19,7 @@ import {
     handleFindTagged,
     handleFileDeps,
     handleRenamePreview,
+    handleCheckAliases,
 } from './query-handler.js';
 import { LspTimeoutError } from '../utils/timeout.js';
 
@@ -186,6 +187,8 @@ export class DaemonHttpServer {
                 return handleFileDeps(this.ctx, args as any);
             case '/api/rename-preview':
                 return handleRenamePreview(this.ctx, args as any);
+            case '/api/check-aliases':
+                return handleCheckAliases(this.ctx, args as any);
             default:
                 return null;
         }

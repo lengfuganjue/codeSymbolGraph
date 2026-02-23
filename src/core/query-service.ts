@@ -1240,6 +1240,125 @@ export class QueryService {
         return results;
     }
 
+    // ===== XLua 别名悬空检测 =====
+
+    /**
+     * 检测悬空的 XLua 别名：Lua 中定义了 C# 类型别名，但对应的 C# 类已被删除或重命名。
+     * 1. 从 lua_aliases 表读取所有别名（或按 file 筛选）
+     * 2. 提取唯一的 C# FQN
+     * 3. 对每个 FQN 用 workspaceSymbol 查询是否存在
+     * 4. 找不到的标记为 dangling
+     */
+    async checkDanglingAliases(params: {
+        file?: string;
+        limit?: number;
+    }): Promise<DanglingAliasResult> {
+        const limit = params.limit ?? 100;
+        const aliases = this.cache.getAllAliases(params.file);
+
+        if (aliases.length === 0) {
+            return { totalChecked: 0, danglingCount: 0, danglingAliases: [] };
+        }
+
+        // 提取唯一的 C# FQN（去掉 CS. 前缀）
+        const fqnSet = new Set<string>();
+        for (const alias of aliases) {
+            const fqn = alias.original_cs_pattern.replace(/^CS\./, '');
+            fqnSet.add(fqn);
+        }
+
+        // 对每个 FQN 检查是否存在于 C# 项目中
+        const fqnExists = new Map<string, boolean>();
+        const csharpClient = this.lspManager.getClientForLanguage('csharp');
+
+        if (csharpClient.state === 'ready') {
+            const checkOneFqn = async (fqn: string) => {
+                const shortName = fqn.includes('.') ? fqn.split('.').pop()! : fqn;
+                try {
+                    const symbols = await csharpClient.workspaceSymbol(shortName);
+                    const found = symbols.some((s: SymbolInformation) => {
+                        const container = s.containerName ?? '';
+                        if (container) {
+                            const symFqn = `${container}.${s.name}`;
+                            return symFqn === fqn || symFqn.endsWith(`.${fqn}`) || (fqn.endsWith(`.${s.name}`) && container.endsWith(fqn.split('.').slice(0, -1).join('.')));
+                        }
+                        if (s.name === shortName && !fqn.includes('.')) return true;
+                        return this.parseCsharpLsSymbolForFqn(s.name, fqn);
+                    });
+                    fqnExists.set(fqn, found);
+                } catch (e) {
+                    if (e instanceof LspTimeoutError) {
+                        console.error(`[CSG] checkDanglingAliases: workspaceSymbol timeout for "${shortName}"`);
+                        fqnExists.set(fqn, true);
+                    } else {
+                        throw e;
+                    }
+                }
+            };
+
+            // 并发控制：批量查询 workspaceSymbol
+            const CONCURRENCY = 8;
+            const fqnList = [...fqnSet];
+            for (let i = 0; i < fqnList.length; i += CONCURRENCY) {
+                const batch = fqnList.slice(i, i + CONCURRENCY);
+                await Promise.allSettled(batch.map(fqn => checkOneFqn(fqn)));
+            }
+        } else {
+            // LSP 未就绪，全部标记为存在（不误报）
+            for (const fqn of fqnSet) {
+                fqnExists.set(fqn, true);
+            }
+        }
+
+        // 构建 dangling 列表
+        const danglingAliases: DanglingAliasResult['danglingAliases'] = [];
+        for (const alias of aliases) {
+            if (danglingAliases.length >= limit) break;
+
+            const fqn = alias.original_cs_pattern.replace(/^CS\./, '');
+            if (!fqnExists.get(fqn)) {
+                danglingAliases.push({
+                    aliasName: alias.alias_name,
+                    csharpFqn: fqn,
+                    luaFile: alias.lua_file.replace(/\\/g, '/'),
+                    luaLine: alias.lua_line,
+                    reason: 'C# symbol not found via workspaceSymbol',
+                });
+            }
+        }
+
+        return {
+            totalChecked: aliases.length,
+            danglingCount: danglingAliases.length,
+            danglingAliases,
+        };
+    }
+
+    /**
+     * 解析 csharp-ls 的 workspaceSymbol name 格式，检查是否匹配目标 FQN。
+     * csharp-ls 的类符号 name 通常是短名，但方法可能是 "ReturnType Container.Member(params)"。
+     * 对于类/接口/结构体等类型符号，name 通常就是类名本身。
+     */
+    private parseCsharpLsSymbolForFqn(symbolName: string, targetFqn: string): boolean {
+        // 尝试解析 "ReturnType Container.Member(params)" 格式
+        const match = symbolName.match(/\s([\w.]+)\.([\w]+)\s*(?:\(|$)/);
+        if (match) {
+            const fullFqn = `${match[1]}.${match[2]}`;
+            return fullFqn === targetFqn || targetFqn.endsWith(fullFqn);
+        }
+        // 简单格式
+        const simpleMatch = symbolName.match(/^([\w.]+)\.([\w]+)\s*(?:\(|$)/);
+        if (simpleMatch) {
+            const fullFqn = `${simpleMatch[1]}.${simpleMatch[2]}`;
+            return fullFqn === targetFqn || targetFqn.endsWith(fullFqn);
+        }
+        // 直接类名匹配（仅单段 FQN，多段时无法仅靠短名确认命名空间）
+        if (!targetFqn.includes('.')) {
+            return symbolName === targetFqn;
+        }
+        return false;
+    }
+
     /** 同一行的多个变更去重（保留最后一个） */
     private deduplicateLineChanges(
         changes: { line: number; oldText: string; newText: string }[],
@@ -2225,6 +2344,18 @@ export interface FileDepsResult {
     dependents: {
         luaRequiredBy: Array<{ file: string; line: number }>;
     };
+}
+
+export interface DanglingAliasResult {
+    totalChecked: number;
+    danglingCount: number;
+    danglingAliases: Array<{
+        aliasName: string;
+        csharpFqn: string;
+        luaFile: string;
+        luaLine: number;
+        reason: string;
+    }>;
 }
 
 export interface RenamePreview {
