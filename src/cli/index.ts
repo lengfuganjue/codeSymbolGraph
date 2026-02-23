@@ -738,6 +738,7 @@ program
             'hierarchy': { endpoint: '/api/hierarchy', method: 'POST' },
             'find-tagged': { endpoint: '/api/find-tagged', method: 'POST' },
             'find-deps': { endpoint: '/api/file-deps', method: 'POST' },
+            'rename-preview': { endpoint: '/api/rename-preview', method: 'POST' },
         };
 
         const mapping = toolMap[tool];
@@ -1005,6 +1006,30 @@ function formatQueryResult(tool: string, result: unknown): void {
                     if (r.snippet) console.log(`    ${r.snippet.replace(/\n/g, '\n    ')}`);
                 }
                 if (requiredBy.length > 30) console.log(`  ... ${requiredBy.length - 30} more`);
+            }
+            break;
+        }
+
+        case 'rename-preview': {
+            console.log(`Symbol: ${data?.symbol}`);
+            console.log(`Rename: ${data?.oldName} → ${data?.newName}`);
+            console.log(`Total changes: ${data?.totalChanges || 0}`);
+            const rpFiles = data?.files || [];
+            for (const f of rpFiles) {
+                console.log(`\n  ${f.file} [${f.language}] (${f.changes?.length || 0} changes):`);
+                for (const c of (f.changes || []).slice(0, 20)) {
+                    console.log(`    L${c.line}:`);
+                    console.log(`      - ${c.oldText}`);
+                    console.log(`      + ${c.newText}`);
+                }
+                if (f.changes?.length > 20) console.log(`    ... ${f.changes.length - 20} more`);
+            }
+            const rpWarnings = data?.warnings || [];
+            if (rpWarnings.length > 0) {
+                console.log(`\nWarnings:`);
+                for (const w of rpWarnings) {
+                    console.log(`  ⚠ ${w}`);
+                }
             }
             break;
         }

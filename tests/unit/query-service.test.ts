@@ -38,6 +38,7 @@ function createMockLspManager() {
         references: vi.fn().mockResolvedValue([]),
         hover: vi.fn().mockResolvedValue(null),
         documentSymbol: vi.fn().mockResolvedValue([]),
+        rename: vi.fn().mockResolvedValue(null),
     };
 
     return {
@@ -989,5 +990,276 @@ describe('findFileDeps', () => {
             expect(result.deps.luaRequires).toHaveLength(0);
             expect(result.dependents.luaRequiredBy).toHaveLength(1);
         });
+    });
+});
+
+describe('renamePreview', () => {
+    let tmpDir: string;
+    let dbPath: string;
+    let cache: CacheManager;
+    let lspManager: ReturnType<typeof createMockLspManager>;
+    let service: QueryService;
+
+    beforeEach(async () => {
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'csg-rename-'));
+        dbPath = path.join(tmpDir, 'test.db');
+        cache = new CacheManager(dbPath);
+        lspManager = createMockLspManager();
+        service = new QueryService(lspManager, cache, tmpDir);
+    });
+
+    afterEach(async () => {
+        cache.close();
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('should require new_name and name or file', async () => {
+        // name is provided, new_name is provided => should not error on params
+        // When symbol not found, should return empty
+        const result = await service.renamePreview({ name: 'NonExistent', new_name: 'NewName' });
+        expect(result.totalChanges).toBe(0);
+        expect(result.files).toHaveLength(0);
+        expect(result.warnings.length).toBeGreaterThan(0);
+    });
+
+    it('should generate correct oldText/newText via fallback (findReferences + regex)', async () => {
+        // Create a CS file that contains the symbol
+        const csContent = [
+            'using System;',
+            'public class Player {',
+            '    public void Move() { }',
+            '}',
+            'public class Game {',
+            '    Player player = new Player();',
+            '    void Update() { player.Move(); }',
+            '}',
+        ].join('\n');
+        await fsp.writeFile(path.join(tmpDir, 'Player.cs'), csContent);
+
+        // Cache the symbol
+        cache.cacheSymbols('hash1', [makeSymbol({
+            file_path: 'Player.cs',
+            name: 'Player',
+            fqn: 'Player',
+            kind: 5,
+            language: 'csharp',
+            range_start_line: 1,
+            range_start_char: 13,
+        })]);
+
+        // Mock references returning lines where "Player" appears
+        lspManager._mockClient.references.mockResolvedValue([
+            {
+                uri: `file://${tmpDir}/Player.cs`,
+                range: { start: { line: 1, character: 13 }, end: { line: 1, character: 19 } },
+            },
+            {
+                uri: `file://${tmpDir}/Player.cs`,
+                range: { start: { line: 5, character: 4 }, end: { line: 5, character: 10 } },
+            },
+        ]);
+
+        // Mock LSP rename to return null (trigger fallback)
+        lspManager._mockClient.rename = vi.fn().mockResolvedValue(null);
+
+        const result = await service.renamePreview({ name: 'Player', new_name: 'Character' });
+
+        expect(result.oldName).toBe('Player');
+        expect(result.newName).toBe('Character');
+        expect(result.totalChanges).toBeGreaterThan(0);
+
+        // Find the file entry
+        const fileEntry = result.files.find(f => f.file === 'Player.cs');
+        expect(fileEntry).toBeDefined();
+        expect(fileEntry!.language).toBe('csharp');
+
+        // Verify that replacement is correct
+        for (const change of fileEntry!.changes) {
+            expect(change.oldText).toContain('Player');
+            expect(change.newText).toContain('Character');
+            expect(change.newText).not.toContain('Player');
+        }
+    });
+
+    it('should use word boundary regex to avoid replacing substrings', async () => {
+        const csContent = [
+            'public class Get {',
+            '    void GetComponent() { }',
+            '    void DoGet() { }',
+            '    Get instance;',
+            '}',
+        ].join('\n');
+        await fsp.writeFile(path.join(tmpDir, 'Get.cs'), csContent);
+
+        cache.cacheSymbols('hash1', [makeSymbol({
+            file_path: 'Get.cs',
+            name: 'Get',
+            fqn: 'Get',
+            kind: 5,
+            language: 'csharp',
+            range_start_line: 0,
+            range_start_char: 13,
+        })]);
+
+        // Reference on line 3 (0-based) where "Get" appears as standalone word
+        lspManager._mockClient.references.mockResolvedValue([
+            {
+                uri: `file://${tmpDir}/Get.cs`,
+                range: { start: { line: 3, character: 4 }, end: { line: 3, character: 7 } },
+            },
+        ]);
+        lspManager._mockClient.rename = vi.fn().mockResolvedValue(null);
+
+        const result = await service.renamePreview({ name: 'Get', new_name: 'Fetch' });
+
+        const fileEntry = result.files.find(f => f.file === 'Get.cs');
+        expect(fileEntry).toBeDefined();
+
+        // The change on line 4 (1-based) should replace "Get" but not "GetComponent"
+        const change = fileEntry!.changes.find(c => c.line === 4);
+        expect(change).toBeDefined();
+        expect(change!.oldText).toBe('    Get instance;');
+        expect(change!.newText).toBe('    Fetch instance;');
+    });
+
+    it('should include Lua cross-language references for C# symbol', async () => {
+        // Create a Lua file with method call
+        await fsp.writeFile(path.join(tmpDir, 'game.lua'),
+            'local obj = CS.Game.Player()\nobj:Move()\nobj:Attack()\n');
+
+        cache.cacheSymbols('hash1', [makeSymbol({
+            file_path: 'Player.cs',
+            name: 'Move',
+            fqn: 'Game.Player.Move',
+            kind: 6,
+            language: 'csharp',
+            range_start_line: 10,
+            range_start_char: 8,
+        })]);
+
+        // Create the C# file on disk too
+        await fsp.writeFile(path.join(tmpDir, 'Player.cs'),
+            'namespace Game {\n    public class Player {\n        public void Move() { }\n    }\n}\n');
+
+        // Mock: no LSP references, no LSP rename
+        lspManager._mockClient.references.mockResolvedValue([]);
+        lspManager._mockClient.rename = vi.fn().mockResolvedValue(null);
+
+        const result = await service.renamePreview({ name: 'Move', new_name: 'Walk' });
+
+        // Should find the Lua cross-language reference
+        const luaFile = result.files.find(f => f.file === 'game.lua');
+        expect(luaFile).toBeDefined();
+        expect(luaFile!.language).toBe('lua');
+        expect(luaFile!.changes.length).toBeGreaterThan(0);
+
+        const moveChange = luaFile!.changes.find(c => c.oldText.includes('Move'));
+        expect(moveChange).toBeDefined();
+        expect(moveChange!.newText).toContain('Walk');
+
+        // Should have a warning about Lua grep
+        expect(result.warnings.some(w => w.includes('Lua grep'))).toBe(true);
+    });
+
+    it('should return empty files when symbol not found', async () => {
+        const result = await service.renamePreview({ name: 'NoSuchSymbol', new_name: 'NewName' });
+        expect(result.totalChanges).toBe(0);
+        expect(result.files).toHaveLength(0);
+        expect(result.warnings).toContain('Symbol "NoSuchSymbol" not found');
+    });
+
+    it('should parse LSP WorkspaceEdit correctly', async () => {
+        const csContent = [
+            'public class Foo {',
+            '    Foo instance;',
+            '    void UseFoo() { new Foo(); }',
+            '}',
+        ].join('\n');
+        await fsp.writeFile(path.join(tmpDir, 'Foo.cs'), csContent);
+
+        cache.cacheSymbols('hash1', [makeSymbol({
+            file_path: 'Foo.cs',
+            name: 'Foo',
+            fqn: 'Foo',
+            kind: 5,
+            language: 'csharp',
+            range_start_line: 0,
+            range_start_char: 13,
+        })]);
+
+        // Mock LSP rename returning WorkspaceEdit
+        lspManager._mockClient.rename = vi.fn().mockResolvedValue({
+            changes: {
+                [`file://${tmpDir}/Foo.cs`]: [
+                    { range: { start: { line: 0, character: 13 }, end: { line: 0, character: 16 } }, newText: 'Bar' },
+                    { range: { start: { line: 1, character: 4 }, end: { line: 1, character: 7 } }, newText: 'Bar' },
+                    { range: { start: { line: 2, character: 22 }, end: { line: 2, character: 25 } }, newText: 'Bar' },
+                ],
+            },
+        });
+
+        const result = await service.renamePreview({ name: 'Foo', new_name: 'Bar' });
+
+        expect(result.totalChanges).toBe(3);
+        const fileEntry = result.files.find(f => f.file === 'Foo.cs');
+        expect(fileEntry).toBeDefined();
+        expect(fileEntry!.changes).toHaveLength(3);
+
+        // Line 1: "public class Foo {" → "public class Bar {"
+        const line1 = fileEntry!.changes.find(c => c.line === 1);
+        expect(line1).toBeDefined();
+        expect(line1!.oldText).toBe('public class Foo {');
+        expect(line1!.newText).toBe('public class Bar {');
+
+        // Line 2: "    Foo instance;" → "    Bar instance;"
+        const line2 = fileEntry!.changes.find(c => c.line === 2);
+        expect(line2).toBeDefined();
+        expect(line2!.oldText).toBe('    Foo instance;');
+        expect(line2!.newText).toBe('    Bar instance;');
+    });
+
+    it('should handle multi-file references', async () => {
+        // Create two C# files
+        await fsp.writeFile(path.join(tmpDir, 'A.cs'),
+            'public class Helper {\n    public void DoWork() { }\n}\n');
+        await fsp.writeFile(path.join(tmpDir, 'B.cs'),
+            'public class User {\n    Helper h = new Helper();\n}\n');
+
+        cache.cacheSymbols('hash1', [makeSymbol({
+            file_path: 'A.cs',
+            name: 'Helper',
+            fqn: 'Helper',
+            kind: 5,
+            language: 'csharp',
+            range_start_line: 0,
+            range_start_char: 13,
+        })]);
+
+        // References in both files
+        lspManager._mockClient.references.mockResolvedValue([
+            {
+                uri: `file://${tmpDir}/A.cs`,
+                range: { start: { line: 0, character: 13 }, end: { line: 0, character: 19 } },
+            },
+            {
+                uri: `file://${tmpDir}/B.cs`,
+                range: { start: { line: 1, character: 4 }, end: { line: 1, character: 10 } },
+            },
+        ]);
+        lspManager._mockClient.rename = vi.fn().mockResolvedValue(null);
+
+        const result = await service.renamePreview({ name: 'Helper', new_name: 'Utility' });
+
+        expect(result.totalChanges).toBe(2);
+        expect(result.files).toHaveLength(2);
+
+        const fileNames = result.files.map(f => f.file).sort();
+        expect(fileNames).toEqual(['A.cs', 'B.cs']);
+
+        const aFile = result.files.find(f => f.file === 'A.cs');
+        expect(aFile!.changes[0].newText).toContain('Utility');
+
+        const bFile = result.files.find(f => f.file === 'B.cs');
+        expect(bFile!.changes[0].newText).toContain('Utility');
     });
 });

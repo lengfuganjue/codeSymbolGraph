@@ -22,6 +22,7 @@ import {
     handleCheckCsharp,
     handleFindTagged,
     handleFileDeps,
+    handleRenamePreview,
 } from '../daemon/query-handler.js';
 import type { AssetIndex } from '../core/asset-index.js';
 import type { ProtocolIndex } from '../core/protocol-index.js';
@@ -278,6 +279,21 @@ export function registerTools(
         },
         async (args) => wrapTool(lspManager, indexingReady, () =>
             handleFileDeps(ctx, args),
+        ),
+    );
+
+    // ===== csg_rename_preview =====
+    server.tool(
+        'csg_rename_preview',
+        '预览重命名操作：返回所有受影响的文件和行，不实际修改文件。支持 C# + Lua 跨语言。',
+        {
+            name: z.string().optional().describe('符号名（旧名字）'),
+            new_name: z.string().describe('新名字'),
+            file: z.string().optional().describe('文件路径（精确定位模式）'),
+            line: z.number().optional().describe('行号 1-based（精确定位模式）'),
+        },
+        async (args) => wrapTool(lspManager, indexingReady, () =>
+            handleRenamePreview(ctx, args),
         ),
     );
 }

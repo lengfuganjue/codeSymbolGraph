@@ -2,7 +2,7 @@ import { LspManager } from '../lsp/lsp-manager.js';
 import { CacheManager, type CachedSymbol } from '../cache/cache-manager.js';
 import { relativeToUri, uriToRelative } from '../utils/uri.js';
 import { LspTimeoutError } from '../utils/timeout.js';
-import type { Location, DocumentSymbol, SymbolInformation } from 'vscode-languageserver-protocol';
+import type { Location, DocumentSymbol, SymbolInformation, WorkspaceEdit, TextEdit } from 'vscode-languageserver-protocol';
 import { glob } from 'glob';
 import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
@@ -881,6 +881,382 @@ export class QueryService {
         }
 
         return result;
+    }
+
+    // ===== 重命名预览 =====
+
+    /**
+     * 预览重命名操作：返回所有受影响的文件和行，不实际修改文件。
+     * 1. 解析符号（按名字或文件位置）
+     * 2. 优先尝试 LSP textDocument/rename
+     * 3. Fallback: findReferences + 正则替换预览
+     * 4. C# 符号额外查 xlua 跨语言 Lua 引用
+     */
+    async renamePreview(params: {
+        name?: string;
+        new_name: string;
+        file?: string;
+        line?: number;
+    }): Promise<RenamePreview> {
+        const { new_name: newName } = params;
+        const warnings: string[] = [];
+
+        // 1. 解析符号
+        let file: string | undefined;
+        let line: number | undefined;
+        let character = 0;
+        let symbolFqn = '';
+        let language = '';
+
+        if (params.file && params.line != null) {
+            file = params.file;
+            line = params.line;
+            language = this.detectLanguage(params.file);
+            // 也尝试 resolve 得到 fqn
+            if (params.name) {
+                const resolved = await this.resolveSymbol(params.name);
+                if (resolved.length > 0) {
+                    symbolFqn = resolved[0].fqn;
+                    language = resolved[0].language;
+                }
+            }
+        } else if (params.name) {
+            const resolved = await this.resolveSymbol(params.name);
+            if (resolved.length === 0) {
+                return {
+                    symbol: params.name,
+                    oldName: params.name,
+                    newName,
+                    totalChanges: 0,
+                    files: [],
+                    warnings: [`Symbol "${params.name}" not found`],
+                };
+            }
+            const first = resolved[0];
+            file = first.file;
+            line = first.line + 1; // resolveSymbol returns 0-based, LSP needs 0-based but findReferences expects 1-based
+            character = first.character;
+            symbolFqn = first.fqn;
+            language = first.language;
+        }
+
+        if (!file || line == null) {
+            return {
+                symbol: params.name || '',
+                oldName: params.name || '',
+                newName,
+                totalChanges: 0,
+                files: [],
+                warnings: ['Could not resolve symbol location'],
+            };
+        }
+
+        // 提取短名用于正则替换
+        const shortName = params.name
+            ? (params.name.includes('.') ? params.name.split('.').pop()! : params.name)
+            : symbolFqn.split('.').pop() || '';
+
+        // 2. 尝试 LSP rename
+        const lspResult = await this.tryLspRename(file, line, character, newName);
+        let renameFiles: RenamePreview['files'] = [];
+
+        if (lspResult && lspResult.length > 0) {
+            renameFiles = lspResult;
+            console.error(`[CSG] renamePreview: LSP rename returned ${lspResult.reduce((sum, f) => sum + f.changes.length, 0)} changes`);
+        } else {
+            // 3. Fallback: findReferences + 正则替换
+            console.error(`[CSG] renamePreview: LSP rename unavailable/empty, using findReferences fallback`);
+            renameFiles = await this.renameFallback(file, line, character, symbolFqn, shortName, newName);
+            if (renameFiles.length > 0) {
+                warnings.push('Used findReferences + regex fallback (LSP rename unavailable)');
+            }
+        }
+
+        // 4. 跨语言扩展：C# 符号查 Lua 引用
+        if (language === 'csharp' && shortName) {
+            const luaChanges = await this.renamePreviewLuaCrossLang(shortName, newName);
+            if (luaChanges.length > 0) {
+                renameFiles.push(...luaChanges);
+                warnings.push('Lua grep results may include false positives');
+            }
+        }
+
+        const totalChanges = renameFiles.reduce((sum, f) => sum + f.changes.length, 0);
+
+        return {
+            symbol: symbolFqn || params.name || '',
+            oldName: shortName,
+            newName,
+            totalChanges,
+            files: renameFiles,
+            warnings,
+        };
+    }
+
+    /**
+     * 尝试 LSP textDocument/rename，解析 WorkspaceEdit 为文件级变更预览。
+     * 返回 null 表示 LSP rename 不可用或失败。
+     */
+    private async tryLspRename(
+        file: string, line: number, character: number, newName: string,
+    ): Promise<RenamePreview['files'] | null> {
+        try {
+            const client = this.lspManager.getClientForFile(file);
+            if (client.state !== 'ready') return null;
+
+            const uri = relativeToUri(this.workspaceRoot, file);
+            // line is 1-based from findReferences convention, LSP needs 0-based
+            const lspLine = line - 1;
+            const wsEdit = await client.rename(uri, lspLine, character, newName);
+
+            if (!wsEdit) return null;
+
+            return this.parseWorkspaceEdit(wsEdit);
+        } catch (e) {
+            if (e instanceof LspTimeoutError) {
+                console.error(`[CSG] tryLspRename: LSP timeout`);
+            } else {
+                console.error(`[CSG] tryLspRename: ${(e as Error).message}`);
+            }
+            return null;
+        }
+    }
+
+    /**
+     * 解析 WorkspaceEdit 为文件级变更预览。
+     * 支持 changes（URI → TextEdit[]）和 documentChanges 两种格式。
+     */
+    private parseWorkspaceEdit(
+        wsEdit: WorkspaceEdit,
+    ): RenamePreview['files'] {
+        const fileChangesMap = new Map<string, TextEdit[]>();
+
+        // WorkspaceEdit.changes: { [uri: string]: TextEdit[] }
+        if (wsEdit.changes) {
+            for (const [editUri, edits] of Object.entries(wsEdit.changes)) {
+                const filePath = uriToRelative(this.workspaceRoot, editUri);
+                const existing = fileChangesMap.get(filePath) || [];
+                existing.push(...edits);
+                fileChangesMap.set(filePath, existing);
+            }
+        }
+
+        // WorkspaceEdit.documentChanges: TextDocumentEdit[]
+        if (wsEdit.documentChanges) {
+            for (const docChange of wsEdit.documentChanges) {
+                if ('textDocument' in docChange && 'edits' in docChange) {
+                    const filePath = uriToRelative(this.workspaceRoot, docChange.textDocument.uri);
+                    const existing = fileChangesMap.get(filePath) || [];
+                    existing.push(...(docChange.edits as TextEdit[]));
+                    fileChangesMap.set(filePath, existing);
+                }
+            }
+        }
+
+        if (fileChangesMap.size === 0) return [];
+
+        const results: RenamePreview['files'] = [];
+        // 文件内容缓存，避免重复读取
+        const fileContentCache = new Map<string, string[]>();
+
+        for (const [filePath, edits] of fileChangesMap) {
+            const absPath = path.join(this.workspaceRoot, filePath);
+            let lines: string[];
+
+            if (fileContentCache.has(filePath)) {
+                lines = fileContentCache.get(filePath)!;
+            } else {
+                try {
+                    const content = fsSync.readFileSync(absPath, 'utf-8');
+                    lines = content.split('\n');
+                    fileContentCache.set(filePath, lines);
+                } catch {
+                    console.error(`[CSG] parseWorkspaceEdit: cannot read ${filePath}`);
+                    continue;
+                }
+            }
+
+            const lang = this.detectLanguage(filePath);
+
+            // 按行号分组，同一行多个 TextEdit 需合并应用
+            const editsByLine = new Map<number, TextEdit[]>();
+            for (const edit of edits) {
+                const editLine = edit.range.start.line;
+                if (editLine < 0 || editLine >= lines.length) continue;
+                if (!editsByLine.has(editLine)) editsByLine.set(editLine, []);
+                editsByLine.get(editLine)!.push(edit);
+            }
+
+            const changes: { line: number; oldText: string; newText: string }[] = [];
+            for (const [editLine, lineEdits] of editsByLine) {
+                const oldText = lines[editLine];
+                // 按 start.character 降序排列，从后往前应用避免偏移
+                lineEdits.sort((a, b) => b.range.start.character - a.range.start.character);
+                let newText = oldText;
+                for (const edit of lineEdits) {
+                    const startChar = edit.range.start.character;
+                    const endChar = edit.range.end.line === editLine
+                        ? edit.range.end.character
+                        : newText.length;
+                    newText = newText.substring(0, startChar) + edit.newText + newText.substring(endChar);
+                }
+                if (newText !== oldText) {
+                    changes.push({ line: editLine + 1, oldText, newText });
+                }
+            }
+
+            if (changes.length > 0) {
+                results.push({ file: filePath, language: lang, changes: changes.sort((a, b) => a.line - b.line) });
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * Fallback: 用 findReferences 获取所有引用位置，对每个引用行做正则替换预览。
+     */
+    private async renameFallback(
+        file: string, line: number, character: number,
+        symbolFqn: string, shortName: string, newName: string,
+    ): Promise<RenamePreview['files']> {
+        const refs = await this.findReferences({
+            name: undefined,
+            file,
+            line,
+            character,
+        });
+
+        if (refs.count === 0) return [];
+
+        const escaped = shortName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const pattern = new RegExp(`\\b${escaped}\\b`, 'g');
+
+        // 按文件分组
+        const byFile = new Map<string, { line: number; character: number }[]>();
+        for (const ref of refs.references) {
+            if (!byFile.has(ref.file)) byFile.set(ref.file, []);
+            byFile.get(ref.file)!.push(ref);
+        }
+
+        const results: RenamePreview['files'] = [];
+        const fileContentCache = new Map<string, string[]>();
+
+        for (const [refFile, locs] of byFile) {
+            const absPath = path.join(this.workspaceRoot, refFile);
+            let lines: string[];
+
+            if (fileContentCache.has(refFile)) {
+                lines = fileContentCache.get(refFile)!;
+            } else {
+                try {
+                    const content = fsSync.readFileSync(absPath, 'utf-8');
+                    lines = content.split('\n');
+                    fileContentCache.set(refFile, lines);
+                } catch {
+                    continue;
+                }
+            }
+
+            const lang = this.detectLanguage(refFile);
+            const changes: { line: number; oldText: string; newText: string }[] = [];
+
+            for (const loc of locs) {
+                const lineIdx = loc.line - 1; // references are 1-based
+                if (lineIdx < 0 || lineIdx >= lines.length) continue;
+
+                const oldText = lines[lineIdx];
+                const newText = oldText.replace(pattern, newName);
+
+                if (newText !== oldText) {
+                    changes.push({
+                        line: loc.line, // 1-based
+                        oldText,
+                        newText,
+                    });
+                }
+            }
+
+            if (changes.length > 0) {
+                const deduped = this.deduplicateLineChanges(changes);
+                results.push({ file: refFile, language: lang, changes: deduped });
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * 查询 Lua 中的跨语言引用并生成替换预览。
+     * 用 grepLuaMethodCalls 查找 Lua 中的方法调用。
+     */
+    private async renamePreviewLuaCrossLang(
+        memberName: string, newName: string,
+    ): Promise<RenamePreview['files']> {
+        const luaRefs = await this.grepLuaMethodCalls(memberName, 200);
+        if (luaRefs.length === 0) return [];
+
+        const escaped = memberName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const pattern = new RegExp(`\\b${escaped}\\b`, 'g');
+
+        const byFile = new Map<string, { line: number; character: number }[]>();
+        for (const ref of luaRefs) {
+            if (!byFile.has(ref.file)) byFile.set(ref.file, []);
+            byFile.get(ref.file)!.push(ref);
+        }
+
+        const results: RenamePreview['files'] = [];
+
+        for (const [refFile, locs] of byFile) {
+            const absPath = path.join(this.workspaceRoot, refFile);
+            let lines: string[];
+            try {
+                const content = fsSync.readFileSync(absPath, 'utf-8');
+                lines = content.split('\n');
+            } catch {
+                continue;
+            }
+
+            const changes: { line: number; oldText: string; newText: string }[] = [];
+
+            for (const loc of locs) {
+                const lineIdx = loc.line - 1;
+                if (lineIdx < 0 || lineIdx >= lines.length) continue;
+
+                const oldText = lines[lineIdx];
+                const newText = oldText.replace(pattern, newName);
+
+                if (newText !== oldText) {
+                    changes.push({ line: loc.line, oldText, newText });
+                }
+            }
+
+            if (changes.length > 0) {
+                const deduped = this.deduplicateLineChanges(changes);
+                results.push({ file: refFile, language: 'lua', changes: deduped });
+            }
+        }
+
+        return results;
+    }
+
+    /** 同一行的多个变更去重（保留最后一个） */
+    private deduplicateLineChanges(
+        changes: { line: number; oldText: string; newText: string }[],
+    ): { line: number; oldText: string; newText: string }[] {
+        const seen = new Map<number, { line: number; oldText: string; newText: string }>();
+        for (const change of changes) {
+            seen.set(change.line, change);
+        }
+        return Array.from(seen.values()).sort((a, b) => a.line - b.line);
+    }
+
+    /** 根据文件扩展名检测语言 */
+    private detectLanguage(filePath: string): 'csharp' | 'lua' | 'other' {
+        const normalized = filePath.replace(/\\/g, '/');
+        if (normalized.endsWith('.cs')) return 'csharp';
+        if (normalized.endsWith('.lua')) return 'lua';
+        return 'other';
     }
 
     /**
@@ -1849,4 +2225,21 @@ export interface FileDepsResult {
     dependents: {
         luaRequiredBy: Array<{ file: string; line: number }>;
     };
+}
+
+export interface RenamePreview {
+    symbol: string;
+    oldName: string;
+    newName: string;
+    totalChanges: number;
+    files: Array<{
+        file: string;
+        language: 'csharp' | 'lua' | 'other';
+        changes: Array<{
+            line: number;
+            oldText: string;
+            newText: string;
+        }>;
+    }>;
+    warnings: string[];
 }

@@ -25,6 +25,7 @@ import {
     type CallHierarchyItem,
     type CallHierarchyIncomingCall,
     type CallHierarchyOutgoingCall,
+    type WorkspaceEdit,
     MarkupKind,
 } from 'vscode-languageserver-protocol/node.js';
 import { spawn, type ChildProcess } from 'child_process';
@@ -270,6 +271,19 @@ export class LspClient extends EventEmitter {
             }),
             LSP_TIMEOUT_MS,
             'textDocument/hover',
+        );
+    }
+
+    async rename(uri: string, line: number, character: number, newName: string): Promise<WorkspaceEdit | null> {
+        this.ensureReady();
+        return withTimeout(
+            this.connection!.sendRequest('textDocument/rename', {
+                textDocument: { uri },
+                position: { line, character },
+                newName,
+            }),
+            LSP_TIMEOUT_MS,
+            'textDocument/rename',
         );
     }
 

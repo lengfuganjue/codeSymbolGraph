@@ -8,7 +8,7 @@ import { LspManager } from '../lsp/lsp-manager.js';
 import { CacheManager } from '../cache/cache-manager.js';
 import { successResponse, errorResponse, type McpToolResponse } from '../utils/mcp-response.js';
 import { readSnippet, clearSnippetCache } from '../utils/snippet.js';
-import type { CallChainNode, TaggedClassResult, FileDepsResult } from '../core/query-service.js';
+import type { CallChainNode, TaggedClassResult, FileDepsResult, RenamePreview } from '../core/query-service.js';
 import type { AssetIndex } from '../core/asset-index.js';
 import type { ProtocolIndex } from '../core/protocol-index.js';
 
@@ -579,4 +579,31 @@ export async function handleFileDeps(
     } finally {
         clearSnippetCache();
     }
+}
+
+export async function handleRenamePreview(
+    ctx: QueryContext,
+    args: { name?: string; new_name?: string; file?: string; line?: number },
+): Promise<McpToolResponse> {
+    if (!args.new_name) {
+        const lspStatus = ctx.lspManager.getLspStatusForMcp();
+        return errorResponse('INTERNAL_ERROR', 'new_name is required', lspStatus);
+    }
+    if (!args.name && !args.file) {
+        const lspStatus = ctx.lspManager.getLspStatusForMcp();
+        return errorResponse('INTERNAL_ERROR', 'name or file+line is required', lspStatus);
+    }
+    if (args.file && args.line == null) {
+        const lspStatus = ctx.lspManager.getLspStatusForMcp();
+        return errorResponse('INTERNAL_ERROR', 'line is required when file is provided', lspStatus);
+    }
+
+    const result = await ctx.queryService.renamePreview({
+        name: args.name,
+        new_name: args.new_name,
+        file: args.file,
+        line: args.line,
+    });
+
+    return successResponse(result);
 }
