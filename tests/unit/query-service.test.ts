@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { QueryService } from '../../src/core/query-service.js';
+import { QueryService, classifyFieldAccess } from '../../src/core/query-service.js';
 import { CacheManager, type CachedSymbol } from '../../src/cache/cache-manager.js';
 import * as fs from 'fs';
 import * as fsp from 'fs/promises';
@@ -1644,6 +1644,99 @@ describe('semanticSearch', () => {
     });
 });
 
+describe('findAssetReferences', () => {
+    let tmpDir: string;
+    let dbPath: string;
+    let cache: CacheManager;
+    let service: QueryService;
+
+    beforeEach(async () => {
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'csg-assetref-'));
+        dbPath = path.join(tmpDir, 'test.db');
+        cache = new CacheManager(dbPath);
+        const mockLsp = {
+            getClientForFile: vi.fn().mockReturnValue({ state: 'ready' }),
+            getClientForLanguage: vi.fn().mockReturnValue({ state: 'ready' }),
+            getStatus: vi.fn().mockReturnValue({ csharp: { state: 'ready' }, lua: { state: 'ready' }, allReady: true }),
+            getLspStatusForMcp: vi.fn().mockReturnValue({}),
+        } as any;
+        service = new QueryService(mockLsp, cache, tmpDir);
+    });
+
+    afterEach(async () => {
+        cache.close();
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('matches C# Resources.Load with asset name', async () => {
+        await fsp.writeFile(path.join(tmpDir, 'Loader.cs'), [
+            'using UnityEngine;',
+            'public class Loader {',
+            '    void Load() {',
+            '        var obj = Resources.Load("prefabs/music_city");',
+            '    }',
+            '}',
+        ].join('\n'));
+
+        const results = await service.findAssetReferences('music_city');
+        expect(results).toHaveLength(1);
+        expect(results[0].file).toBe('Loader.cs');
+        expect(results[0].line).toBe(4);
+        expect(results[0].loadPattern).toBe('Resources.Load');
+        expect(results[0].content).toContain('music_city');
+    });
+
+    it('matches Lua string reference with asset name', async () => {
+        await fsp.writeFile(path.join(tmpDir, 'game.lua'), [
+            'local bgm = "music_city"',
+            'playSound(bgm)',
+        ].join('\n'));
+
+        const results = await service.findAssetReferences('music_city');
+        expect(results).toHaveLength(1);
+        expect(results[0].file).toBe('game.lua');
+        expect(results[0].line).toBe(1);
+        expect(results[0].loadPattern).toBe('string_reference');
+        expect(results[0].content).toContain('music_city');
+    });
+
+    it('returns empty array when no matches found', async () => {
+        await fsp.writeFile(path.join(tmpDir, 'empty.cs'),
+            'public class Empty { void Noop() { } }\n');
+        await fsp.writeFile(path.join(tmpDir, 'empty.lua'),
+            'local x = 1\n');
+
+        const results = await service.findAssetReferences('nonexistent_asset_xyz');
+        expect(results).toHaveLength(0);
+    });
+
+    it('respects limit parameter', async () => {
+        const lines = Array.from({ length: 20 }, (_, i) =>
+            `    var x${i} = Resources.Load("icon_hero");`
+        ).join('\n');
+        await fsp.writeFile(path.join(tmpDir, 'Bulk.cs'),
+            `public class Bulk {\n${lines}\n}\n`);
+
+        const results = await service.findAssetReferences('icon_hero', 5);
+        expect(results.length).toBeLessThanOrEqual(5);
+    });
+
+    it('matches asset name within a path in string literal', async () => {
+        await fsp.writeFile(path.join(tmpDir, 'PathLoad.cs'), [
+            'public class PathLoad {',
+            '    void Load() {',
+            '        var obj = Addressables.LoadAssetAsync<GameObject>("Assets/Prefabs/music_city.prefab");',
+            '    }',
+            '}',
+        ].join('\n'));
+
+        const results = await service.findAssetReferences('music_city');
+        expect(results).toHaveLength(1);
+        expect(results[0].loadPattern).toBe('Addressables');
+        expect(results[0].content).toContain('Assets/Prefabs/music_city.prefab');
+    });
+});
+
 describe('checkCycles', () => {
     let tmpDir: string;
     let luaDir: string;
@@ -1787,5 +1880,57 @@ describe('checkCycles', () => {
 
         // a does not actually require b (commented out), so no cycle
         expect(result.cyclesFound).toBe(0);
+    });
+});
+
+describe('classifyFieldAccess', () => {
+    it('simple assignment: count = 5 → write, "="', () => {
+        const result = classifyFieldAccess('count = 5', 'count');
+        expect(result.type).toBe('write');
+        expect(result.pattern).toBe('=');
+    });
+
+    it('compound assignment: count += 1 → write, "+="', () => {
+        const result = classifyFieldAccess('count += 1', 'count');
+        expect(result.type).toBe('write');
+        expect(result.pattern).toBe('+=');
+    });
+
+    it('postfix increment: count++ → write, "++"', () => {
+        const result = classifyFieldAccess('count++', 'count');
+        expect(result.type).toBe('write');
+        expect(result.pattern).toBe('++');
+    });
+
+    it('prefix decrement: --count → write, "--"', () => {
+        const result = classifyFieldAccess('--count', 'count');
+        expect(result.type).toBe('write');
+        expect(result.pattern).toBe('--');
+    });
+
+    it('out parameter: out count → write, "out/ref"', () => {
+        const result = classifyFieldAccess('SomeMethod(out count)', 'count');
+        expect(result.type).toBe('write');
+        expect(result.pattern).toBe('out/ref');
+    });
+
+    it('read in expression: x = count + 1 → read', () => {
+        const result = classifyFieldAccess('x = count + 1', 'count');
+        expect(result.type).toBe('read');
+    });
+
+    it('read in function call: Foo(count) → read', () => {
+        const result = classifyFieldAccess('Foo(count)', 'count');
+        expect(result.type).toBe('read');
+    });
+
+    it('equality check: if (count == 5) → read (== is not assignment)', () => {
+        const result = classifyFieldAccess('if (count == 5)', 'count');
+        expect(result.type).toBe('read');
+    });
+
+    it('inequality check: count != 0 → read (!= is not assignment)', () => {
+        const result = classifyFieldAccess('count != 0', 'count');
+        expect(result.type).toBe('read');
     });
 });

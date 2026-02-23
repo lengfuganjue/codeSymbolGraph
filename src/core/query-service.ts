@@ -91,6 +91,35 @@ export function classifyLineContext(
     return 'unknown';
 }
 
+/**
+ * 判断引用行中字段是读取还是写入（行级启发式）。
+ * 独立导出，方便单元测试。
+ */
+export function classifyFieldAccess(
+    line: string,
+    fieldName: string,
+): { type: 'read' | 'write'; pattern?: string } {
+    const escaped = fieldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // 写入模式：复合赋值或简单赋值（排除 == 和 !=）
+    if (new RegExp(`\\b${escaped}\\s*[+\\-*/%&|^]?=(?!=)`).test(line)) {
+        // 区分复合赋值和简单赋值
+        const compoundMatch = new RegExp(`\\b${escaped}\\s*([+\\-*/%&|^])=`).exec(line);
+        return { type: 'write', pattern: compoundMatch ? `${compoundMatch[1]}=` : '=' };
+    }
+    // 后缀自增
+    if (new RegExp(`\\b${escaped}\\s*\\+\\+`).test(line)) return { type: 'write', pattern: '++' };
+    // 后缀自减
+    if (new RegExp(`\\b${escaped}\\s*--`).test(line)) return { type: 'write', pattern: '--' };
+    // 前缀自增
+    if (new RegExp(`\\+\\+\\s*${escaped}\\b`).test(line)) return { type: 'write', pattern: '++' };
+    // 前缀自减
+    if (new RegExp(`--\\s*${escaped}\\b`).test(line)) return { type: 'write', pattern: '--' };
+    // out/ref 参数
+    if (new RegExp(`\\b(?:out|ref)\\s+${escaped}\\b`).test(line)) return { type: 'write', pattern: 'out/ref' };
+    // 默认为读取
+    return { type: 'read' };
+}
+
 /** normalizeDocSymbols 的返回类型 */
 interface NormalizedSymbols {
     symbols: DocumentSymbol[];
@@ -2612,6 +2641,171 @@ export class QueryService {
         const parts = hoverText.split('```');
         return parts.length >= 3 ? parts[2]?.trim()?.substring(0, 200) : undefined;
     }
+
+    // ===== 资源加载反向查 =====
+
+    /**
+     * 给定资源名，grep 搜索哪些代码文件加载了它。
+     * 匹配字符串字面量中包含 assetName 的行，并识别加载模式。
+     */
+    async findAssetReferences(assetName: string, limit?: number): Promise<AssetCodeReference[]> {
+        const maxResults = limit ?? 100;
+
+        // 转义正则特殊字符
+        const escaped = assetName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+        // 匹配字符串字面量中包含 assetName 的行
+        const pattern = new RegExp(`["']([^"']*${escaped}[^"']*)["']`, 'i');
+
+        const EXCLUDE_DIRS = [
+            '**/node_modules/**', '**/Library/**', '**/Temp/**',
+            '**/XLua/Gen/**', '**/CSObjectWrap/**',
+        ];
+        const MAX_FILES = 5000;
+        const MAX_FILE_SIZE = 1024 * 1024; // 1MB
+
+        const globs = ['**/*.cs', '**/*.lua'];
+        const results: AssetCodeReference[] = [];
+
+        try {
+            let allFiles: string[] = [];
+            for (const g of globs) {
+                const files = await glob(g, {
+                    cwd: this.workspaceRoot,
+                    absolute: false,
+                    ignore: EXCLUDE_DIRS,
+                });
+                allFiles = allFiles.concat(files);
+                if (allFiles.length > MAX_FILES) {
+                    allFiles = allFiles.slice(0, MAX_FILES);
+                    break;
+                }
+            }
+
+            for (const file of allFiles) {
+                if (results.length >= maxResults) break;
+
+                const absPath = path.join(this.workspaceRoot, file);
+                let stat: import('fs').Stats;
+                try { stat = fsSync.statSync(absPath); } catch { continue; }
+                if (stat.size > MAX_FILE_SIZE) continue;
+
+                let content: string;
+                try { content = fsSync.readFileSync(absPath, 'utf-8'); } catch { continue; }
+
+                const normalized = file.replace(/\\/g, '/');
+                const lines = content.split('\n');
+
+                for (let i = 0; i < lines.length; i++) {
+                    if (results.length >= maxResults) break;
+                    if (!pattern.test(lines[i])) continue;
+
+                    const loadPattern = this.classifyLoadPattern(lines[i], normalized);
+                    results.push({
+                        file: normalized,
+                        line: i + 1,
+                        content: lines[i],
+                        loadPattern,
+                    });
+                }
+            }
+        } catch (e) {
+            console.error(`[CSG] findAssetReferences error: ${(e as Error).message}`);
+        }
+
+        return results;
+    }
+
+    /**
+     * 识别资源加载模式（启发式）。
+     */
+    private classifyLoadPattern(line: string, file: string): string {
+        const isCsharp = file.endsWith('.cs');
+        const isLua = file.endsWith('.lua');
+
+        if (isCsharp) {
+            if (/Resources\s*\.\s*Load/i.test(line)) return 'Resources.Load';
+            if (/Addressables\s*\.\s*(LoadAsset|InstantiateAsync|LoadScene)/i.test(line)) return 'Addressables';
+            if (/AssetBundle\s*\.\s*Load/i.test(line)) return 'AssetBundle';
+            if (/AssetDatabase\s*\.\s*(LoadAsset|FindAssets)/i.test(line)) return 'AssetDatabase';
+        }
+
+        if (isLua) {
+            if (/res[_.]?[Ll]oad|[Ll]oad[Rr]es/i.test(line)) return 'lua_res_load';
+            if (/[Rr]esource[sS]?.*[Ll]oad/i.test(line)) return 'lua_resources_load';
+        }
+
+        return 'string_reference';
+    }
+
+    // ===== 字段读写分析 =====
+
+    /**
+     * 分析字段的所有引用，区分读取和写入。
+     * 调用 findReferences 获取引用，读取每行内容后用 classifyFieldAccess 分类。
+     */
+    async analyzeFieldAccess(params: {
+        name: string;
+        access_type?: 'read' | 'write' | 'all';
+    }): Promise<FieldAccessResult> {
+        const accessType = params.access_type ?? 'all';
+
+        // 1. 获取所有引用
+        const refResult = await this.findReferences({ name: params.name });
+
+        const reads: FieldAccessRead[] = [];
+        const writes: FieldAccessWrite[] = [];
+
+        // 2. 逐个引用读取行内容并分类
+        for (const ref of refResult.references) {
+            let lineContent: string;
+            try {
+                const absPath = path.resolve(this.workspaceRoot, ref.file);
+                const content = fsSync.readFileSync(absPath, 'utf-8');
+                const lines = content.split('\n');
+                // ref.line is 1-based
+                lineContent = lines[ref.line - 1] ?? '';
+            } catch {
+                // 文件不可读则跳过
+                continue;
+            }
+
+            // 提取字段短名（用于 classifyFieldAccess 的行级匹配）
+            const fieldName = params.name.includes('.')
+                ? params.name.split('.').pop()!
+                : params.name;
+
+            const classification = classifyFieldAccess(lineContent, fieldName);
+
+            if (classification.type === 'write') {
+                if (accessType === 'all' || accessType === 'write') {
+                    writes.push({
+                        file: ref.file,
+                        line: ref.line,
+                        content: lineContent.trim(),
+                        confidence: ref.confidence ?? 'medium',
+                        writePattern: classification.pattern!,
+                    });
+                }
+            } else {
+                if (accessType === 'all' || accessType === 'read') {
+                    reads.push({
+                        file: ref.file,
+                        line: ref.line,
+                        content: lineContent.trim(),
+                        confidence: ref.confidence ?? 'medium',
+                    });
+                }
+            }
+        }
+
+        return {
+            symbol: refResult.symbolFqn || params.name,
+            totalReferences: refResult.count,
+            reads,
+            writes,
+        };
+    }
 }
 
 // ===== 类型定义 =====
@@ -2744,4 +2938,37 @@ export interface SearchResult {
         context: SemanticContext;
         confidence: 'medium';
     }>;
+}
+
+export interface FieldAccessItem {
+    file: string;
+    line: number;
+    content: string;
+    confidence: Confidence;
+}
+
+export interface FieldAccessRead extends FieldAccessItem {}
+
+export interface FieldAccessWrite extends FieldAccessItem {
+    writePattern: string;  // '=', '+=', '++', '--', 'out/ref'
+}
+
+export interface FieldAccessResult {
+    symbol: string;
+    totalReferences: number;
+    reads: FieldAccessRead[];
+    writes: FieldAccessWrite[];
+}
+
+export interface AssetCodeReference {
+    file: string;
+    line: number;
+    content: string;
+    loadPattern: string;
+}
+
+export interface AssetRefsResult {
+    assetName: string;
+    assetPaths: string[];
+    codeReferences: AssetCodeReference[];
 }

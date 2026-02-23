@@ -742,6 +742,7 @@ program
             'check-aliases': { endpoint: '/api/check-aliases', method: 'POST' },
             'search': { endpoint: '/api/search', method: 'POST' },
             'check-cycles': { endpoint: '/api/check-cycles', method: 'POST' },
+            'field-access': { endpoint: '/api/field-access', method: 'POST' },
         };
 
         const mapping = toolMap[tool];
@@ -894,14 +895,28 @@ function formatQueryResult(tool: string, result: unknown): void {
         }
 
         case 'find-asset': {
-            const assets = data?.results || [];
-            for (const a of assets) {
-                console.log(`${a.shortName}:`);
-                for (const p of a.fullPaths) {
-                    console.log(`  ${p}`);
+            const direction = data?.direction || 'forward';
+            if (direction === 'forward' || direction === 'both') {
+                const assets = data?.results || [];
+                for (const a of assets) {
+                    console.log(`${a.shortName}:`);
+                    for (const p of a.fullPaths) {
+                        console.log(`  ${p}`);
+                    }
+                }
+                console.log(`\n${data?.count || 0} asset(s) found`);
+            }
+            if (direction === 'reverse' || direction === 'both') {
+                const codeRefs = data?.codeReferences || [];
+                if (direction === 'both' && codeRefs.length > 0) console.log('');
+                console.log(`Code references (${data?.codeReferenceCount || 0}):`);
+                for (const r of codeRefs.slice(0, 50)) {
+                    console.log(`  ${r.file}:${r.line} [${r.loadPattern}] ${r.content}`);
+                }
+                if (codeRefs.length > 50) {
+                    console.log(`  ... ${codeRefs.length - 50} more`);
                 }
             }
-            console.log(`\n${data?.count || 0} asset(s) found`);
             break;
         }
 
@@ -1072,6 +1087,29 @@ function formatQueryResult(tool: string, result: unknown): void {
             }
             if (cycles.length === 0) {
                 console.log('\nNo circular dependencies detected.');
+            }
+            break;
+        }
+
+        case 'field-access': {
+            console.log(`Symbol: ${data?.symbol}`);
+            console.log(`Total references: ${data?.totalReferences || 0}`);
+            console.log(`Reads: ${data?.readCount || 0}, Writes: ${data?.writeCount || 0}`);
+            const faReads = data?.reads || [];
+            if (faReads.length > 0) {
+                console.log('\nReads:');
+                for (const r of faReads.slice(0, 30)) {
+                    console.log(`  ${r.file}:${r.line} ${r.content}`);
+                }
+                if (faReads.length > 30) console.log(`  ... ${faReads.length - 30} more`);
+            }
+            const faWrites = data?.writes || [];
+            if (faWrites.length > 0) {
+                console.log('\nWrites:');
+                for (const w of faWrites.slice(0, 30)) {
+                    console.log(`  ${w.file}:${w.line} [${w.writePattern}] ${w.content}`);
+                }
+                if (faWrites.length > 30) console.log(`  ... ${faWrites.length - 30} more`);
             }
             break;
         }

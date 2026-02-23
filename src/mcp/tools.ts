@@ -26,6 +26,7 @@ import {
     handleCheckAliases,
     handleSearch,
     handleCheckCycles,
+    handleFieldAccess,
 } from '../daemon/query-handler.js';
 import type { AssetIndex } from '../core/asset-index.js';
 import type { ProtocolIndex } from '../core/protocol-index.js';
@@ -204,9 +205,11 @@ export function registerTools(
     // ===== csg_find_asset =====
     server.tool(
         'csg_find_asset',
-        '按资源短名查找完整路径。支持精确匹配和模糊搜索。例如查找 "music_city" 返回资源完整路径。',
+        '按资源短名查找完整路径（forward），或反向查找哪些代码文件加载了该资源（reverse），或两者兼查（both）。',
         {
             name: z.string().describe('资源短名（如 "music_city.wav" 或 "uniquetype"）'),
+            direction: z.enum(['forward', 'reverse', 'both']).optional().default('forward').describe('查询方向：forward=资源名→路径, reverse=资源名→代码引用, both=双向（默认 forward）'),
+            limit: z.number().optional().default(100).describe('reverse 方向最大返回条数（默认 100）'),
         },
         async (args) => {
             const result = await handleFindAsset(ctx, args);
@@ -339,6 +342,19 @@ export function registerTools(
         },
         async (args) => wrapTool(lspManager, indexingReady, () =>
             handleCheckCycles(ctx, args),
+        ),
+    );
+
+    // ===== csg_field_access =====
+    server.tool(
+        'csg_field_access',
+        '分析 C# 字段的读写访问。给定字段名，找到所有引用并区分读取（read）和写入（write，包括赋值、自增、out/ref 等）。',
+        {
+            name: z.string().describe('字段名（如 "PlayerData.health" 或 "count"）'),
+            access_type: z.enum(['read', 'write', 'all']).optional().default('all').describe('过滤类型：read=只看读取, write=只看写入, all=全部（默认）'),
+        },
+        async (args) => wrapTool(lspManager, indexingReady, () =>
+            handleFieldAccess(ctx, args),
         ),
     );
 }

@@ -8,7 +8,7 @@ import { LspManager } from '../lsp/lsp-manager.js';
 import { CacheManager } from '../cache/cache-manager.js';
 import { successResponse, errorResponse, type McpToolResponse } from '../utils/mcp-response.js';
 import { readSnippet, clearSnippetCache } from '../utils/snippet.js';
-import type { CallChainNode, TaggedClassResult, FileDepsResult, RenamePreview, DanglingAliasResult, CycleCheckResult, Confidence, SearchResult } from '../core/query-service.js';
+import type { CallChainNode, TaggedClassResult, FileDepsResult, RenamePreview, DanglingAliasResult, CycleCheckResult, Confidence, SearchResult, AssetRefsResult, FieldAccessResult } from '../core/query-service.js';
 import type { AssetIndex } from '../core/asset-index.js';
 import type { ProtocolIndex } from '../core/protocol-index.js';
 
@@ -354,23 +354,62 @@ export async function handleStatus(
 
 export async function handleFindAsset(
     ctx: QueryContext,
-    args: { name: string },
+    args: { name: string; direction?: string; limit?: number },
 ): Promise<McpToolResponse> {
     const lspStatus = ctx.lspManager.getLspStatusForMcp();
+    const direction = (args.direction || 'forward') as 'forward' | 'reverse' | 'both';
 
-    if (!ctx.assetIndex?.isLoaded) {
-        return errorResponse('NOT_AVAILABLE', 'Asset index not loaded (no AssetsNameToolCacheFile.txt found)', lspStatus);
+    // reverse / both 需要 grep 搜索代码引用
+    let codeReferences: { file: string; line: number; content: string; loadPattern: string }[] = [];
+    if (direction === 'reverse' || direction === 'both') {
+        codeReferences = await ctx.queryService.findAssetReferences(args.name, args.limit);
     }
 
-    const results = ctx.assetIndex.find(args.name);
-    if (results.length === 0) {
-        return errorResponse('NO_MATCH', `No asset found matching: ${args.name}`, lspStatus);
+    // forward / both 需要资源索引
+    let assetResults: { shortName: string; fullPaths: string[] }[] = [];
+    if (direction === 'forward' || direction === 'both') {
+        if (!ctx.assetIndex?.isLoaded) {
+            if (direction === 'forward') {
+                return errorResponse('NOT_AVAILABLE', 'Asset index not loaded (no AssetsNameToolCacheFile.txt found)', lspStatus);
+            }
+            // direction=both: 即使资源索引不可用，仍返回 reverse 结果
+        } else {
+            const found = ctx.assetIndex.find(args.name);
+            assetResults = found.map(r => ({ shortName: r.shortName, fullPaths: r.fullPaths }));
+        }
     }
 
-    return successResponse({
-        results: results.map(r => ({ shortName: r.shortName, fullPaths: r.fullPaths })),
-        count: results.length,
-    });
+    // 检查是否有任何结果
+    if (assetResults.length === 0 && codeReferences.length === 0) {
+        if (direction === 'forward') {
+            return errorResponse('NO_MATCH', `No asset found matching: ${args.name}`, lspStatus);
+        }
+        if (direction === 'reverse') {
+            return errorResponse('NO_MATCH', `No code references found for asset: ${args.name}`, lspStatus);
+        }
+        return errorResponse('NO_MATCH', `No asset or code references found for: ${args.name}`, lspStatus);
+    }
+
+    const response: Record<string, unknown> = {};
+
+    if (direction === 'forward' || direction === 'both') {
+        response.results = assetResults;
+        response.count = assetResults.length;
+    }
+
+    if (direction === 'reverse' || direction === 'both') {
+        response.codeReferences = codeReferences.map(r => ({
+            file: r.file,
+            line: r.line,
+            content: r.content.trim(),
+            loadPattern: r.loadPattern,
+        }));
+        response.codeReferenceCount = codeReferences.length;
+    }
+
+    response.direction = direction;
+
+    return successResponse(response);
 }
 
 export async function handleFindProtocol(
@@ -657,4 +696,37 @@ export async function handleCheckCycles(
     });
 
     return successResponse(result);
+}
+
+export async function handleFieldAccess(
+    ctx: QueryContext,
+    args: { name: string; access_type?: string },
+): Promise<McpToolResponse> {
+    try {
+        const result = await ctx.queryService.analyzeFieldAccess({
+            name: args.name,
+            access_type: (args.access_type as 'read' | 'write' | 'all') ?? 'all',
+        });
+
+        const lspStatus = ctx.lspManager.getLspStatusForMcp();
+
+        if (result.totalReferences === 0) {
+            return errorResponse(
+                'NO_MATCH',
+                `No references found for field: ${args.name}`,
+                lspStatus,
+            );
+        }
+
+        return successResponse({
+            symbol: result.symbol,
+            totalReferences: result.totalReferences,
+            reads: result.reads,
+            writes: result.writes,
+            readCount: result.reads.length,
+            writeCount: result.writes.length,
+        });
+    } finally {
+        clearSnippetCache();
+    }
 }

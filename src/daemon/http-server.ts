@@ -22,6 +22,7 @@ import {
     handleCheckAliases,
     handleSearch,
     handleCheckCycles,
+    handleFieldAccess,
 } from './query-handler.js';
 import { LspTimeoutError } from '../utils/timeout.js';
 
@@ -195,6 +196,8 @@ export class DaemonHttpServer {
                 return handleSearch(this.ctx, args as any);
             case '/api/check-cycles':
                 return handleCheckCycles(this.ctx, args as any);
+            case '/api/field-access':
+                return handleFieldAccess(this.ctx, args as any);
             default:
                 return null;
         }
