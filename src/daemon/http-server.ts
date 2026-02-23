@@ -16,6 +16,7 @@ import {
     handleFindProtocol,
     handleCheckLua,
     handleCheckCsharp,
+    handleFindTagged,
 } from './query-handler.js';
 import { LspTimeoutError } from '../utils/timeout.js';
 
@@ -177,6 +178,8 @@ export class DaemonHttpServer {
                 return handleCheckLua(this.ctx, args as any);
             case '/api/check-csharp':
                 return handleCheckCsharp(this.ctx, args as any);
+            case '/api/find-tagged':
+                return handleFindTagged(this.ctx, args as any);
             default:
                 return null;
         }

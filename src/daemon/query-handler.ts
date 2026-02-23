@@ -8,7 +8,7 @@ import { LspManager } from '../lsp/lsp-manager.js';
 import { CacheManager } from '../cache/cache-manager.js';
 import { successResponse, errorResponse, type McpToolResponse } from '../utils/mcp-response.js';
 import { readSnippet, clearSnippetCache } from '../utils/snippet.js';
-import type { CallChainNode } from '../core/query-service.js';
+import type { CallChainNode, TaggedClassResult } from '../core/query-service.js';
 import type { AssetIndex } from '../core/asset-index.js';
 import type { ProtocolIndex } from '../core/protocol-index.js';
 
@@ -503,4 +503,37 @@ export async function handleCheckCsharp(
     }
 
     return successResponse(data);
+}
+
+export async function handleFindTagged(
+    ctx: QueryContext,
+    args: { tag: string; limit?: number },
+): Promise<McpToolResponse> {
+    try {
+        const results = await ctx.queryService.findTaggedClasses(args.tag, args.limit ?? 50);
+        const lspStatus = ctx.lspManager.getLspStatusForMcp();
+
+        if (results.length === 0) {
+            return errorResponse(
+                'NO_MATCH',
+                `No classes found with tag: ${args.tag}`,
+                lspStatus,
+            );
+        }
+
+        return successResponse({
+            tag: args.tag,
+            results: results.map(r => ({
+                name: r.name,
+                file: r.file,
+                line: r.line,
+                tag: r.tag,
+                tagType: r.tagType,
+                snippet: readSnippet(ctx.workspaceRoot, r.file, r.line, 1),
+            })),
+            count: results.length,
+        });
+    } finally {
+        clearSnippetCache();
+    }
 }

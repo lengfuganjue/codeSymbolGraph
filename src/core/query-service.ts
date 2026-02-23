@@ -730,6 +730,103 @@ export class QueryService {
         return results;
     }
 
+    // ===== 按 attribute / 基类查询 =====
+
+    /**
+     * 按 C# attribute 或基类名查询类。
+     * - attribute 匹配: `[Tag]` 或 `[Tag(` 模式，向下找最近的 class/struct 声明
+     * - 基类匹配: `class X : ...Tag...` 模式
+     * 自动判断是 attribute 还是 base_class（两种都搜）。
+     */
+    async findTaggedClasses(tag: string, limit = 50): Promise<TaggedClassResult[]> {
+        const results: TaggedClassResult[] = [];
+        const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+        const attrPattern = new RegExp(`\\[\\s*${escaped}(?:\\s*[\\](])`, 'm');
+        const basePattern = new RegExp(
+            `\\b(?:class|struct)\\s+(\\w+)(?:<[^>]*>)?\\s*:[^{]*\\b${escaped}\\b`,
+        );
+
+        const EXCLUDE_DIRS = [
+            '**/node_modules/**', '**/Library/**', '**/Temp/**',
+        ];
+        const EXCLUDE_DIR_PATTERNS = [
+            /\bXLua[/\\]Gen\b/i,
+            /\bCSObjectWrap\b/i,
+            /\bEditor\b/i,
+        ];
+
+        try {
+            const csFiles = await glob('**/*.cs', {
+                cwd: this.workspaceRoot,
+                absolute: false,
+                ignore: EXCLUDE_DIRS,
+            });
+
+            for (const file of csFiles) {
+                const normalized = file.replace(/\\/g, '/');
+                if (EXCLUDE_DIR_PATTERNS.some(p => p.test(normalized))) continue;
+
+                const absPath = path.join(this.workspaceRoot, file);
+                let content: string;
+                try { content = await fs.readFile(absPath, 'utf-8'); } catch { continue; }
+
+                const lines = content.split('\n');
+
+                // 1. attribute 匹配
+                for (let i = 0; i < lines.length; i++) {
+                    if (!attrPattern.test(lines[i])) continue;
+
+                    // 向下找最近的 class/struct 声明（最多 10 行）
+                    for (let j = i; j < Math.min(i + 10, lines.length); j++) {
+                        const classMatch = lines[j].match(/\b(?:class|struct)\s+(\w+)/);
+                        if (classMatch) {
+                            results.push({
+                                name: classMatch[1],
+                                file: normalized,
+                                line: j + 1,
+                                tag,
+                                tagType: 'attribute',
+                            });
+                            break;
+                        }
+                    }
+
+                    if (results.length >= limit) break;
+                }
+
+                // 2. 基类匹配
+                if (results.length < limit) {
+                    for (let i = 0; i < lines.length; i++) {
+                        const match = basePattern.exec(lines[i]);
+                        if (match) {
+                            // 排除已经通过 attribute 找到的同一行
+                            const dup = results.some(
+                                r => r.file === normalized && r.line === i + 1,
+                            );
+                            if (!dup) {
+                                results.push({
+                                    name: match[1],
+                                    file: normalized,
+                                    line: i + 1,
+                                    tag,
+                                    tagType: 'base_class',
+                                });
+                            }
+                        }
+                        if (results.length >= limit) break;
+                    }
+                }
+
+                if (results.length >= limit) break;
+            }
+        } catch (e) {
+            console.error(`[CSG] findTaggedClasses error: ${(e as Error).message}`);
+        }
+
+        return results;
+    }
+
     /**
      * 通过 callHierarchy 直接获取 incoming callers（LuaLS 支持）
      */
@@ -1472,4 +1569,12 @@ export interface HierarchyResult {
     target: ResolvedSymbol | null;
     baseTypes: { name: string }[];
     implementations: { name: string; file: string; line: number }[];
+}
+
+export interface TaggedClassResult {
+    name: string;
+    file: string;
+    line: number;
+    tag: string;
+    tagType: 'attribute' | 'base_class';
 }

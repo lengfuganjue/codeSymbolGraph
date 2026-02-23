@@ -736,6 +736,7 @@ program
             'check-lua': { endpoint: '/api/check-lua', method: 'POST' },
             'check-csharp': { endpoint: '/api/check-csharp', method: 'POST' },
             'hierarchy': { endpoint: '/api/hierarchy', method: 'POST' },
+            'find-tagged': { endpoint: '/api/find-tagged', method: 'POST' },
         };
 
         const mapping = toolMap[tool];
@@ -752,7 +753,7 @@ program
                 // 检查是否是 key=value 格式
                 const hasKeyValue = queryArgs.some(a => a.includes('='));
                 if (hasKeyValue) {
-                    const firstArgKey = (tool === 'check-lua' || tool === 'check-csharp') ? 'file' : 'name';
+                    const firstArgKey = (tool === 'check-lua' || tool === 'check-csharp') ? 'file' : tool === 'find-tagged' ? 'tag' : 'name';
                     for (const arg of queryArgs) {
                         const eqIdx = arg.indexOf('=');
                         if (eqIdx > 0) {
@@ -770,7 +771,7 @@ program
                     }
                 } else {
                     // check-lua/check-csharp 的第一个参数是 file，其他工具是 name
-                    const firstArgKey = (tool === 'check-lua' || tool === 'check-csharp') ? 'file' : 'name';
+                    const firstArgKey = (tool === 'check-lua' || tool === 'check-csharp') ? 'file' : tool === 'find-tagged' ? 'tag' : 'name';
                     body[firstArgKey] = queryArgs[0];
                 }
             }
@@ -956,6 +957,17 @@ function formatQueryResult(tool: string, result: unknown): void {
                 }
                 if (impls.length > 30) console.log(`  ... ${impls.length - 30} more`);
             }
+            break;
+        }
+
+        case 'find-tagged': {
+            console.log(`Tag: ${data?.tag}`);
+            const tagged = data?.results || [];
+            for (const t of tagged) {
+                console.log(`  ${t.name} [${t.tagType}] — ${t.file}:${t.line}`);
+                if (t.snippet) console.log(`    ${t.snippet.replace(/\n/g, '\n    ')}`);
+            }
+            console.log(`\n${data?.count || 0} class(es) found`);
             break;
         }
 

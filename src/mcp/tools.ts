@@ -20,6 +20,7 @@ import {
     handleFindProtocol,
     handleCheckLua,
     handleCheckCsharp,
+    handleFindTagged,
 } from '../daemon/query-handler.js';
 import type { AssetIndex } from '../core/asset-index.js';
 import type { ProtocolIndex } from '../core/protocol-index.js';
@@ -250,6 +251,19 @@ export function registerTools(
         },
         async (args) => wrapTool(lspManager, indexingReady, () =>
             handleCheckCsharp(ctx, args),
+        ),
+    );
+
+    // ===== csg_find_tagged =====
+    server.tool(
+        'csg_find_tagged',
+        '查找标注了指定 attribute 或继承了指定基类的 C# 类。如查所有 MonoBehaviour 子类、所有 [LuaCallCSharp] 标注类。',
+        {
+            tag: z.string().describe('attribute 名或基类名（如 "MonoBehaviour"、"LuaCallCSharp"、"Hotfix"）'),
+            limit: z.number().optional().default(50).describe('最大返回数量（默认 50）'),
+        },
+        async (args) => wrapTool(lspManager, indexingReady, () =>
+            handleFindTagged(ctx, args),
         ),
     );
 }

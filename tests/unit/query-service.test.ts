@@ -584,3 +584,111 @@ describe('grepLuaMethodCalls', () => {
         expect(results.length).toBe(2);
     });
 });
+
+describe('findTaggedClasses', () => {
+    let tmpDir: string;
+    let dbPath: string;
+    let cache: CacheManager;
+    let service: QueryService;
+
+    beforeEach(async () => {
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'csg-tagged-'));
+        dbPath = path.join(tmpDir, 'test.db');
+        cache = new CacheManager(dbPath);
+        const mockLsp = {
+            getClientForFile: vi.fn().mockReturnValue({ state: 'ready' }),
+            getClientForLanguage: vi.fn().mockReturnValue({ state: 'ready' }),
+            getStatus: vi.fn().mockReturnValue({ csharp: { state: 'ready' }, lua: { state: 'ready' }, allReady: true }),
+            getLspStatusForMcp: vi.fn().mockReturnValue({}),
+        } as any;
+        service = new QueryService(mockLsp, cache, tmpDir);
+    });
+
+    afterEach(async () => {
+        cache.close();
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('matches attribute [LuaCallCSharp]', async () => {
+        await fsp.writeFile(path.join(tmpDir, 'A.cs'),
+            '[LuaCallCSharp]\npublic class MyClass { }\n');
+        const results = await service.findTaggedClasses('LuaCallCSharp');
+        expect(results).toHaveLength(1);
+        expect(results[0].name).toBe('MyClass');
+        expect(results[0].tagType).toBe('attribute');
+        expect(results[0].line).toBe(2);
+    });
+
+    it('matches attribute with parameters [Hotfix(HotfixFlag.Stateless)]', async () => {
+        await fsp.writeFile(path.join(tmpDir, 'B.cs'),
+            '[Hotfix(HotfixFlag.Stateless)]\npublic class HotfixTarget { }\n');
+        const results = await service.findTaggedClasses('Hotfix');
+        expect(results).toHaveLength(1);
+        expect(results[0].name).toBe('HotfixTarget');
+        expect(results[0].tagType).toBe('attribute');
+    });
+
+    it('matches base class: class Foo : MonoBehaviour', async () => {
+        await fsp.writeFile(path.join(tmpDir, 'C.cs'),
+            'public class PlayerController : MonoBehaviour {\n}\n');
+        const results = await service.findTaggedClasses('MonoBehaviour');
+        expect(results).toHaveLength(1);
+        expect(results[0].name).toBe('PlayerController');
+        expect(results[0].tagType).toBe('base_class');
+        expect(results[0].line).toBe(1);
+    });
+
+    it('matches base class with multiple interfaces: class Foo : MonoBehaviour, IDisposable', async () => {
+        await fsp.writeFile(path.join(tmpDir, 'D.cs'),
+            'public class GameManager : MonoBehaviour, IDisposable {\n}\n');
+        const results = await service.findTaggedClasses('MonoBehaviour');
+        expect(results).toHaveLength(1);
+        expect(results[0].name).toBe('GameManager');
+        expect(results[0].tagType).toBe('base_class');
+    });
+
+    it('excludes generated code directories (XLua/Gen)', async () => {
+        const genDir = path.join(tmpDir, 'XLua', 'Gen');
+        fs.mkdirSync(genDir, { recursive: true });
+        await fsp.writeFile(path.join(genDir, 'E.cs'),
+            '[LuaCallCSharp]\npublic class GenClass { }\n');
+        const results = await service.findTaggedClasses('LuaCallCSharp');
+        expect(results).toHaveLength(0);
+    });
+
+    it('excludes Editor directory', async () => {
+        const editorDir = path.join(tmpDir, 'Editor');
+        fs.mkdirSync(editorDir, { recursive: true });
+        await fsp.writeFile(path.join(editorDir, 'F.cs'),
+            '[LuaCallCSharp]\npublic class EditorClass { }\n');
+        const results = await service.findTaggedClasses('LuaCallCSharp');
+        expect(results).toHaveLength(0);
+    });
+
+    it('returns empty for no matches', async () => {
+        await fsp.writeFile(path.join(tmpDir, 'G.cs'),
+            'public class NormalClass { }\n');
+        const results = await service.findTaggedClasses('LuaCallCSharp');
+        expect(results).toHaveLength(0);
+    });
+
+    it('finds both attribute and base class matches', async () => {
+        await fsp.writeFile(path.join(tmpDir, 'H.cs'),
+            '[Serializable]\npublic class DataA { }\n');
+        await fsp.writeFile(path.join(tmpDir, 'I.cs'),
+            'public class DataB : Serializable {\n}\n');
+        const results = await service.findTaggedClasses('Serializable');
+        expect(results).toHaveLength(2);
+        const types = results.map(r => r.tagType).sort();
+        expect(types).toEqual(['attribute', 'base_class']);
+    });
+
+    it('respects limit parameter', async () => {
+        for (let i = 0; i < 10; i++) {
+            await fsp.writeFile(path.join(tmpDir, `L${i}.cs`),
+                `[Hotfix]\npublic class Cls${i} { }\n`);
+        }
+        const results = await service.findTaggedClasses('Hotfix', 3);
+        expect(results.length).toBeLessThanOrEqual(3);
+    });
+});
