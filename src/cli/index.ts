@@ -740,6 +740,8 @@ program
             'find-deps': { endpoint: '/api/file-deps', method: 'POST' },
             'rename-preview': { endpoint: '/api/rename-preview', method: 'POST' },
             'check-aliases': { endpoint: '/api/check-aliases', method: 'POST' },
+            'search': { endpoint: '/api/search', method: 'POST' },
+            'check-cycles': { endpoint: '/api/check-cycles', method: 'POST' },
         };
 
         const mapping = toolMap[tool];
@@ -756,7 +758,7 @@ program
                 // 检查是否是 key=value 格式
                 const hasKeyValue = queryArgs.some(a => a.includes('='));
                 if (hasKeyValue) {
-                    const firstArgKey = (tool === 'check-lua' || tool === 'check-csharp' || tool === 'find-deps' || tool === 'check-aliases') ? 'file' : tool === 'find-tagged' ? 'tag' : 'name';
+                    const firstArgKey = (tool === 'check-lua' || tool === 'check-csharp' || tool === 'find-deps' || tool === 'check-aliases' || tool === 'check-cycles') ? 'file' : tool === 'find-tagged' ? 'tag' : tool === 'search' ? 'pattern' : 'name';
                     for (const arg of queryArgs) {
                         const eqIdx = arg.indexOf('=');
                         if (eqIdx > 0) {
@@ -773,8 +775,8 @@ program
                         }
                     }
                 } else {
-                    // check-lua/check-csharp/find-deps/check-aliases 的第一个参数是 file，其他工具是 name
-                    const firstArgKey = (tool === 'check-lua' || tool === 'check-csharp' || tool === 'find-deps' || tool === 'check-aliases') ? 'file' : tool === 'find-tagged' ? 'tag' : 'name';
+                    // check-lua/check-csharp/find-deps/check-aliases/check-cycles 的第一个参数是 file，其他工具是 name
+                    const firstArgKey = (tool === 'check-lua' || tool === 'check-csharp' || tool === 'find-deps' || tool === 'check-aliases' || tool === 'check-cycles') ? 'file' : tool === 'find-tagged' ? 'tag' : tool === 'search' ? 'pattern' : 'name';
                     body[firstArgKey] = queryArgs[0];
                 }
             }
@@ -1045,6 +1047,31 @@ function formatQueryResult(tool: string, result: unknown): void {
                     console.log(`  ${d.aliasName} -> ${d.csharpFqn}`);
                     console.log(`    ${d.luaFile}:${d.luaLine} (${d.reason})`);
                 }
+            }
+            break;
+        }
+
+        case 'search': {
+            console.log(`Total matches: ${data?.totalMatches || 0}`);
+            const searchResults = data?.results || [];
+            for (const r of searchResults.slice(0, 50)) {
+                console.log(`  ${r.file}:${r.line} [${r.context}] ${r.content.trim()}`);
+            }
+            if (searchResults.length > 50) {
+                console.log(`  ... ${searchResults.length - 50} more results`);
+            }
+            break;
+        }
+
+        case 'check-cycles': {
+            console.log(`Files scanned: ${data?.totalFilesScanned || 0}`);
+            console.log(`Cycles found: ${data?.cyclesFound || 0}`);
+            const cycles = data?.cycles || [];
+            for (const c of cycles) {
+                console.log(`\n  [length=${c.length}] ${c.chain.join(' -> ')}`);
+            }
+            if (cycles.length === 0) {
+                console.log('\nNo circular dependencies detected.');
             }
             break;
         }

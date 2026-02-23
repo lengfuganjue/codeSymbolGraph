@@ -1533,3 +1533,259 @@ describe('confidence scoring', () => {
         });
     });
 });
+
+describe('semanticSearch', () => {
+    let tmpDir: string;
+    let dbPath: string;
+    let cache: CacheManager;
+    let service: QueryService;
+
+    beforeEach(async () => {
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'csg-search-'));
+        dbPath = path.join(tmpDir, 'test.db');
+        cache = new CacheManager(dbPath);
+        const mockLsp = {
+            getClientForFile: vi.fn().mockReturnValue({ state: 'ready' }),
+            getClientForLanguage: vi.fn().mockReturnValue({ state: 'ready' }),
+            getStatus: vi.fn().mockReturnValue({ csharp: { state: 'ready' }, lua: { state: 'ready' }, allReady: true }),
+            getLspStatusForMcp: vi.fn().mockReturnValue({}),
+        } as any;
+        service = new QueryService(mockLsp, cache, tmpDir);
+
+        // Create test files
+        await fsp.writeFile(path.join(tmpDir, 'Player.cs'), [
+            '// FooBar is a helper',
+            'public void FooBar() {',
+            '    obj.FooBar(x);',
+            '    string s = "FooBar";',
+            '}',
+        ].join('\n'));
+
+        await fsp.writeFile(path.join(tmpDir, 'game.lua'), [
+            '-- FooBar is used here',
+            'function FooBar()',
+            '    obj:FooBar(x)',
+            'end',
+        ].join('\n'));
+    });
+
+    afterEach(async () => {
+        cache.close();
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('C# comment filtering: // FooBar should be marked as comment', async () => {
+        const result = await service.semanticSearch({ pattern: 'FooBar', language: 'csharp' });
+        const commentResults = result.results.filter(r => r.context === 'comment');
+        expect(commentResults.length).toBeGreaterThanOrEqual(1);
+        expect(commentResults.some(r => r.content.includes('// FooBar'))).toBe(true);
+    });
+
+    it('C# definition identification: public void FooBar() should be marked as definition', async () => {
+        const result = await service.semanticSearch({ pattern: 'FooBar', language: 'csharp' });
+        const defResults = result.results.filter(r => r.context === 'definition');
+        expect(defResults.length).toBeGreaterThanOrEqual(1);
+        expect(defResults.some(r => r.content.includes('public void FooBar()'))).toBe(true);
+    });
+
+    it('Lua comment filtering: -- FooBar should be marked as comment', async () => {
+        const result = await service.semanticSearch({ pattern: 'FooBar', language: 'lua' });
+        const commentResults = result.results.filter(r => r.context === 'comment');
+        expect(commentResults.length).toBeGreaterThanOrEqual(1);
+        expect(commentResults.some(r => r.content.includes('-- FooBar'))).toBe(true);
+    });
+
+    it('Lua function definition: function FooBar() should be marked as definition', async () => {
+        const result = await service.semanticSearch({ pattern: 'FooBar', language: 'lua' });
+        const defResults = result.results.filter(r => r.context === 'definition');
+        expect(defResults.length).toBeGreaterThanOrEqual(1);
+        expect(defResults.some(r => r.content.includes('function FooBar()'))).toBe(true);
+    });
+
+    it('call identification: obj.FooBar(x) should be marked as call', async () => {
+        const result = await service.semanticSearch({ pattern: 'FooBar' });
+        const callResults = result.results.filter(r => r.context === 'call');
+        expect(callResults.length).toBeGreaterThanOrEqual(1);
+        // At least the C# obj.FooBar(x) or Lua obj:FooBar(x) should be call
+        expect(callResults.some(r => r.content.includes('FooBar(x)'))).toBe(true);
+    });
+
+    it('context filter: context=call should only return call type', async () => {
+        const result = await service.semanticSearch({ pattern: 'FooBar', context: 'call' });
+        for (const r of result.results) {
+            expect(r.context).toBe('call');
+        }
+        expect(result.results.length).toBeGreaterThan(0);
+    });
+
+    it('language filter: language=lua should only search .lua files', async () => {
+        const result = await service.semanticSearch({ pattern: 'FooBar', language: 'lua' });
+        for (const r of result.results) {
+            expect(r.file).toMatch(/\.lua$/);
+        }
+        expect(result.results.length).toBeGreaterThan(0);
+    });
+
+    it('invalid regex pattern should throw error', async () => {
+        await expect(service.semanticSearch({ pattern: '[invalid' }))
+            .rejects.toThrow('Invalid regex pattern');
+    });
+
+    it('respects limit parameter', async () => {
+        const result = await service.semanticSearch({ pattern: 'FooBar', limit: 2 });
+        expect(result.results.length).toBeLessThanOrEqual(2);
+        expect(result.totalMatches).toBeLessThanOrEqual(2);
+    });
+
+    it('returns empty results when pattern has no matches', async () => {
+        const result = await service.semanticSearch({ pattern: 'NonExistentSymbol12345' });
+        expect(result.totalMatches).toBe(0);
+        expect(result.results).toHaveLength(0);
+    });
+});
+
+describe('checkCycles', () => {
+    let tmpDir: string;
+    let luaDir: string;
+    let dbPath: string;
+    let cache: CacheManager;
+    let service: QueryService;
+
+    beforeEach(async () => {
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'csg-cycles-'));
+        luaDir = path.join(tmpDir, 'Lua');
+        fs.mkdirSync(luaDir, { recursive: true });
+        dbPath = path.join(tmpDir, 'test.db');
+        cache = new CacheManager(dbPath);
+        const mockLsp = {
+            getClientForFile: vi.fn().mockReturnValue({ state: 'ready' }),
+            getClientForLanguage: vi.fn().mockReturnValue({ state: 'ready' }),
+            getStatus: vi.fn().mockReturnValue({
+                csharp: { state: 'ready', name: 'csharp-ls' },
+                lua: { state: 'ready', name: 'LuaLS' },
+            }),
+            getLspStatusForMcp: vi.fn().mockReturnValue({ csharp: 'ready', lua: 'ready' }),
+        } as any;
+        service = new QueryService(mockLsp, cache, tmpDir);
+    });
+
+    afterEach(() => {
+        cache.close();
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('no cycles: linear dependency a -> b -> c', async () => {
+        // Create Lua files with linear dependencies
+        fs.writeFileSync(path.join(luaDir, 'a.lua'), 'local b = require("Lua.b")\nreturn {}');
+        fs.writeFileSync(path.join(luaDir, 'b.lua'), 'local c = require("Lua.c")\nreturn {}');
+        fs.writeFileSync(path.join(luaDir, 'c.lua'), 'return {}');
+
+        const result = await service.checkCycles({});
+
+        expect(result.cyclesFound).toBe(0);
+        expect(result.cycles).toHaveLength(0);
+        expect(result.totalFilesScanned).toBe(3);
+    });
+
+    it('simple cycle: a -> b -> a', async () => {
+        fs.writeFileSync(path.join(luaDir, 'a.lua'), 'local b = require("Lua.b")\nreturn {}');
+        fs.writeFileSync(path.join(luaDir, 'b.lua'), 'local a = require("Lua.a")\nreturn {}');
+
+        const result = await service.checkCycles({});
+
+        expect(result.cyclesFound).toBe(1);
+        expect(result.cycles[0].length).toBe(2);
+        // Cycle chain should contain both files and loop back
+        const chain = result.cycles[0].chain;
+        expect(chain).toHaveLength(3); // [x, y, x]
+        expect(chain[0]).toBe(chain[chain.length - 1]); // first = last
+        expect(chain).toContain('Lua/a.lua');
+        expect(chain).toContain('Lua/b.lua');
+    });
+
+    it('three-node cycle: a -> b -> c -> a', async () => {
+        fs.writeFileSync(path.join(luaDir, 'a.lua'), 'local b = require("Lua.b")\nreturn {}');
+        fs.writeFileSync(path.join(luaDir, 'b.lua'), 'local c = require("Lua.c")\nreturn {}');
+        fs.writeFileSync(path.join(luaDir, 'c.lua'), 'local a = require("Lua.a")\nreturn {}');
+
+        const result = await service.checkCycles({});
+
+        expect(result.cyclesFound).toBe(1);
+        expect(result.cycles[0].length).toBe(3);
+        const chain = result.cycles[0].chain;
+        expect(chain).toHaveLength(4); // [x, y, z, x]
+        expect(chain[0]).toBe(chain[chain.length - 1]);
+    });
+
+    it('multiple independent cycles: a<->b, c<->d', async () => {
+        fs.writeFileSync(path.join(luaDir, 'a.lua'), 'local b = require("Lua.b")\nreturn {}');
+        fs.writeFileSync(path.join(luaDir, 'b.lua'), 'local a = require("Lua.a")\nreturn {}');
+        fs.writeFileSync(path.join(luaDir, 'c.lua'), 'local d = require("Lua.d")\nreturn {}');
+        fs.writeFileSync(path.join(luaDir, 'd.lua'), 'local c = require("Lua.c")\nreturn {}');
+
+        const result = await service.checkCycles({});
+
+        expect(result.cyclesFound).toBe(2);
+        expect(result.cycles).toHaveLength(2);
+    });
+
+    it('from specified file: only detects cycles reachable from that file', async () => {
+        // a -> b -> a (cycle), c -> d -> c (independent cycle)
+        fs.writeFileSync(path.join(luaDir, 'a.lua'), 'local b = require("Lua.b")\nreturn {}');
+        fs.writeFileSync(path.join(luaDir, 'b.lua'), 'local a = require("Lua.a")\nreturn {}');
+        fs.writeFileSync(path.join(luaDir, 'c.lua'), 'local d = require("Lua.d")\nreturn {}');
+        fs.writeFileSync(path.join(luaDir, 'd.lua'), 'local c = require("Lua.c")\nreturn {}');
+
+        const result = await service.checkCycles({ file: 'Lua/a.lua' });
+
+        // Should only find the a<->b cycle
+        expect(result.cyclesFound).toBe(1);
+        const chain = result.cycles[0].chain;
+        expect(chain).toContain('Lua/a.lua');
+        expect(chain).toContain('Lua/b.lua');
+        // Should NOT contain c or d
+        expect(chain).not.toContain('Lua/c.lua');
+        expect(chain).not.toContain('Lua/d.lua');
+    });
+
+    it('depth limit: max_depth=2 does not detect 3-level cycles', async () => {
+        // a -> b -> c -> a (3-node cycle needs depth > 2 to detect)
+        fs.writeFileSync(path.join(luaDir, 'a.lua'), 'local b = require("Lua.b")\nreturn {}');
+        fs.writeFileSync(path.join(luaDir, 'b.lua'), 'local c = require("Lua.c")\nreturn {}');
+        fs.writeFileSync(path.join(luaDir, 'c.lua'), 'local a = require("Lua.a")\nreturn {}');
+
+        const result = await service.checkCycles({ max_depth: 2 });
+
+        // With max_depth=2, DFS goes a(0)->b(1)->c(2) and then tries to visit a at depth 3 which exceeds limit
+        expect(result.cyclesFound).toBe(0);
+    });
+
+    it('csharp language returns empty result', async () => {
+        const result = await service.checkCycles({ language: 'csharp' });
+
+        expect(result.totalFilesScanned).toBe(0);
+        expect(result.cyclesFound).toBe(0);
+        expect(result.cycles).toHaveLength(0);
+    });
+
+    it('cycle deduplication: same cycle from different starting points', async () => {
+        // a -> b -> a forms one cycle, detected from both a and b
+        fs.writeFileSync(path.join(luaDir, 'a.lua'), 'local b = require("Lua.b")\nreturn {}');
+        fs.writeFileSync(path.join(luaDir, 'b.lua'), 'local a = require("Lua.a")\nreturn {}');
+
+        const result = await service.checkCycles({});
+
+        // Should deduplicate to just 1 cycle
+        expect(result.cyclesFound).toBe(1);
+    });
+
+    it('skips commented-out requires', async () => {
+        fs.writeFileSync(path.join(luaDir, 'a.lua'), '-- local b = require("Lua.b")\nreturn {}');
+        fs.writeFileSync(path.join(luaDir, 'b.lua'), 'local a = require("Lua.a")\nreturn {}');
+
+        const result = await service.checkCycles({});
+
+        // a does not actually require b (commented out), so no cycle
+        expect(result.cyclesFound).toBe(0);
+    });
+});

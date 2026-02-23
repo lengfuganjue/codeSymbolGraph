@@ -8,7 +8,7 @@ import { LspManager } from '../lsp/lsp-manager.js';
 import { CacheManager } from '../cache/cache-manager.js';
 import { successResponse, errorResponse, type McpToolResponse } from '../utils/mcp-response.js';
 import { readSnippet, clearSnippetCache } from '../utils/snippet.js';
-import type { CallChainNode, TaggedClassResult, FileDepsResult, RenamePreview, DanglingAliasResult, Confidence } from '../core/query-service.js';
+import type { CallChainNode, TaggedClassResult, FileDepsResult, RenamePreview, DanglingAliasResult, CycleCheckResult, Confidence, SearchResult } from '../core/query-service.js';
 import type { AssetIndex } from '../core/asset-index.js';
 import type { ProtocolIndex } from '../core/protocol-index.js';
 
@@ -622,6 +622,38 @@ export async function handleCheckAliases(
     const result = await ctx.queryService.checkDanglingAliases({
         file: args.file,
         limit: args.limit,
+    });
+
+    return successResponse(result);
+}
+
+export async function handleSearch(
+    ctx: QueryContext,
+    args: { pattern: string; language?: string; context?: string; limit?: number },
+): Promise<McpToolResponse> {
+    try {
+        const result = await ctx.queryService.semanticSearch({
+            pattern: args.pattern,
+            language: (args.language as 'csharp' | 'lua' | 'all') ?? 'all',
+            context: (args.context as 'call' | 'definition' | 'comment' | 'string' | 'all') ?? 'all',
+            limit: args.limit,
+        });
+
+        return successResponse(result);
+    } catch (e) {
+        const lspStatus = ctx.lspManager.getLspStatusForMcp();
+        return errorResponse('INTERNAL_ERROR', (e as Error).message, lspStatus);
+    }
+}
+
+export async function handleCheckCycles(
+    ctx: QueryContext,
+    args: { file?: string; language?: string; max_depth?: number },
+): Promise<McpToolResponse> {
+    const result = await ctx.queryService.checkCycles({
+        file: args.file,
+        language: (args.language as 'lua' | 'csharp' | 'all') ?? 'lua',
+        max_depth: args.max_depth,
     });
 
     return successResponse(result);

@@ -27,6 +27,70 @@ function definitionPriority(filePath: string): number {
     return 50;
 }
 
+/**
+ * 行级语义上下文分类（启发式）。
+ * 判断某一行代码是注释、字符串、定义还是调用。
+ */
+export function classifyLineContext(
+    line: string,
+    language: 'csharp' | 'lua',
+): 'call' | 'definition' | 'comment' | 'string' | 'unknown' {
+    const trimmed = line.trimStart();
+
+    if (language === 'csharp') {
+        // 注释：行以 // 开头 或 以 /* 开头（块注释起始行） 或 以 * 开头（块注释中间行）
+        if (trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*')) {
+            return 'comment';
+        }
+        // 字符串：简单启发式 - 行以引号包围的字面量为主体
+        // 如果 trimmed 去掉前面的赋值/return 后以 " 或 @" 或 $" 开头，标记为 string
+        if (/^\s*"/.test(trimmed) || /^\s*\$"/.test(trimmed) || /^\s*@"/.test(trimmed)) {
+            return 'string';
+        }
+        // 定义：包含类/方法/属性定义关键字
+        if (/\b(class|interface|enum|struct)\s+\w/.test(trimmed)) {
+            return 'definition';
+        }
+        if (/\b(public|private|protected|internal|static|virtual|override|abstract|async)\s+/.test(trimmed)
+            && /\b(void|int|bool|string|float|double|long|decimal|byte|char|object|var|Task|IEnumerable|List|Dictionary)\s+\w+\s*[({]/.test(trimmed)) {
+            return 'definition';
+        }
+        if (/\b(public|private|protected|internal|static)\s+/.test(trimmed)
+            && /\b(class|interface|enum|struct|void)\b/.test(trimmed)) {
+            return 'definition';
+        }
+        // 包含方法返回类型 + 方法名 + ( 的模式
+        if (/\b(public|private|protected|internal|static|virtual|override|abstract|async)\s+/.test(trimmed)
+            && /\w+\s+\w+\s*\(/.test(trimmed)
+            && !trimmed.includes('=')) {
+            return 'definition';
+        }
+        // 剩余归为 call
+        return 'call';
+    }
+
+    if (language === 'lua') {
+        // 注释：行以 -- 开头
+        if (trimmed.startsWith('--')) {
+            return 'comment';
+        }
+        // 字符串：行以引号开头（赋值到字符串变量场景）
+        if (/^\s*["']/.test(trimmed) || /^\s*\[\[/.test(trimmed)) {
+            return 'string';
+        }
+        // 定义：包含 function 关键字（定义形式）
+        if (/\bfunction\s+\w/.test(trimmed)
+            || /\blocal\s+function\s+\w/.test(trimmed)
+            || /=\s*function\s*\(/.test(trimmed)) {
+            return 'definition';
+        }
+        // 剩余归为 call
+        return 'call';
+    }
+
+    return 'unknown';
+}
+
 /** normalizeDocSymbols 的返回类型 */
 interface NormalizedSymbols {
     symbols: DocumentSymbol[];
@@ -829,6 +893,107 @@ export class QueryService {
         return results;
     }
 
+    // ===== 语义搜索 =====
+
+    /**
+     * 带语义过滤的搜索：在 grep 基础上判断每个匹配行是调用、定义、注释还是字符串。
+     * 使用行级启发式（80/20 原则），不做完美语义分析。
+     */
+    async semanticSearch(params: {
+        pattern: string;
+        language?: 'csharp' | 'lua' | 'all';
+        context?: 'call' | 'definition' | 'comment' | 'string' | 'all';
+        limit?: number;
+    }): Promise<SearchResult> {
+        const language = params.language ?? 'all';
+        const contextFilter = params.context ?? 'all';
+        const limit = params.limit ?? 100;
+
+        let regex: RegExp;
+        try {
+            regex = new RegExp(params.pattern);
+        } catch (e) {
+            throw new Error(`Invalid regex pattern: ${(e as Error).message}`);
+        }
+
+        const EXCLUDE_DIRS = [
+            '**/node_modules/**', '**/Library/**', '**/Temp/**',
+        ];
+        const MAX_FILES = 5000;
+        const MAX_FILE_SIZE = 1024 * 1024; // 1MB
+
+        // 按语言选择 glob 模式
+        let patterns: string[];
+        if (language === 'csharp') {
+            patterns = ['**/*.cs'];
+        } else if (language === 'lua') {
+            patterns = ['**/*.lua'];
+        } else {
+            patterns = ['**/*.cs', '**/*.lua'];
+        }
+
+        const results: SearchResult['results'] = [];
+
+        try {
+            let allFiles: string[] = [];
+            for (const pattern of patterns) {
+                const files = await glob(pattern, {
+                    cwd: this.workspaceRoot,
+                    absolute: false,
+                    ignore: EXCLUDE_DIRS,
+                });
+                allFiles = allFiles.concat(files);
+                if (allFiles.length > MAX_FILES) {
+                    allFiles = allFiles.slice(0, MAX_FILES);
+                    break;
+                }
+            }
+
+            for (const file of allFiles) {
+                if (results.length >= limit) break;
+
+                const normalized = file.replace(/\\/g, '/');
+                const absPath = path.join(this.workspaceRoot, file);
+
+                // 跳过大文件
+                let stat: import('fs').Stats;
+                try { stat = fsSync.statSync(absPath); } catch { continue; }
+                if (stat.size > MAX_FILE_SIZE) continue;
+
+                let content: string;
+                try { content = fsSync.readFileSync(absPath, 'utf-8'); } catch { continue; }
+
+                const lines = content.split('\n');
+                const fileLang = normalized.endsWith('.cs') ? 'csharp'
+                    : normalized.endsWith('.lua') ? 'lua'
+                    : 'unknown';
+
+                for (let i = 0; i < lines.length; i++) {
+                    if (results.length >= limit) break;
+                    if (!regex.test(lines[i])) continue;
+
+                    const ctx = classifyLineContext(lines[i], fileLang as 'csharp' | 'lua');
+                    if (contextFilter !== 'all' && ctx !== contextFilter) continue;
+
+                    results.push({
+                        file: normalized,
+                        line: i + 1,
+                        content: lines[i],
+                        context: ctx,
+                        confidence: 'medium',
+                    });
+                }
+            }
+        } catch (e) {
+            console.error(`[CSG] semanticSearch error: ${(e as Error).message}`);
+        }
+
+        return {
+            totalMatches: results.length,
+            results,
+        };
+    }
+
     // ===== 文件依赖查询 =====
 
     /**
@@ -1377,6 +1542,166 @@ export class QueryService {
         if (normalized.endsWith('.cs')) return 'csharp';
         if (normalized.endsWith('.lua')) return 'lua';
         return 'other';
+    }
+
+    // ===== 循环依赖检测 =====
+
+    /**
+     * 检测 Lua require 中的循环依赖。
+     * 构建依赖图后用 DFS 检测环，返回所有发现的循环链。
+     */
+    async checkCycles(params: {
+        file?: string;
+        language?: 'lua' | 'csharp' | 'all';
+        max_depth?: number;
+    }): Promise<CycleCheckResult> {
+        const maxDepth = params.max_depth ?? 10;
+        const language = params.language ?? 'lua';
+
+        // 目前主要检测 Lua require 循环
+        if (language === 'csharp') {
+            return { totalFilesScanned: 0, cyclesFound: 0, cycles: [] };
+        }
+
+        // 1. 构建依赖图：扫描所有 Lua 文件
+        const graph = new Map<string, string[]>();
+        const luaGlob = language === 'all'
+            ? '**/*.{lua,cs}'
+            : '**/*.lua';
+
+        const files = await glob(luaGlob, {
+            cwd: this.workspaceRoot,
+            ignore: ['**/node_modules/**', '**/Library/**', '**/Temp/**', '**/obj/**', '**/bin/**'],
+        });
+
+        const MAX_FILE_SIZE = 1024 * 1024; // 1MB
+
+        for (const file of files) {
+            if (!file.endsWith('.lua')) continue;
+
+            const absPath = path.join(this.workspaceRoot, file);
+            try {
+                const stat = fsSync.statSync(absPath);
+                if (stat.size > MAX_FILE_SIZE) continue;
+            } catch {
+                continue;
+            }
+
+            let content: string;
+            try {
+                content = fsSync.readFileSync(absPath, 'utf-8');
+            } catch {
+                continue;
+            }
+
+            const requires = this.extractLuaRequires(content, file);
+            const deps: string[] = [];
+            for (const req of requires) {
+                if (req.resolvedFile) {
+                    deps.push(req.resolvedFile);
+                }
+            }
+
+            const normalizedFile = file.replace(/\\/g, '/');
+            if (deps.length > 0) {
+                graph.set(normalizedFile, deps);
+            } else {
+                // 确保所有文件都在图中（即使没有依赖）
+                graph.set(normalizedFile, []);
+            }
+        }
+
+        // 2. DFS 检测环
+        const visited = new Set<string>();
+        const inStack = new Set<string>();
+        const rawCycles: string[][] = [];
+
+        const dfs = (node: string, pathStack: string[], depth: number): void => {
+            if (depth > maxDepth) return;
+
+            if (inStack.has(node)) {
+                // 找到环！从 path 中提取环
+                const cycleStart = pathStack.indexOf(node);
+                if (cycleStart >= 0) {
+                    const cycle = pathStack.slice(cycleStart).concat(node);
+                    rawCycles.push(cycle);
+                }
+                return;
+            }
+
+            if (visited.has(node)) return;
+
+            visited.add(node);
+            inStack.add(node);
+            pathStack.push(node);
+
+            const deps = graph.get(node) || [];
+            for (const dep of deps) {
+                dfs(dep, pathStack, depth + 1);
+            }
+
+            pathStack.pop();
+            inStack.delete(node);
+        };
+
+        // 3. 从指定文件或所有文件出发 DFS
+        if (params.file) {
+            const normalizedFile = params.file.replace(/\\/g, '/');
+            dfs(normalizedFile, [], 0);
+        } else {
+            for (const node of graph.keys()) {
+                if (!visited.has(node)) {
+                    dfs(node, [], 0);
+                }
+            }
+        }
+
+        // 4. 环去重：归一化后去重（同一个环可能从不同起点发现）
+        const uniqueCycles = this.deduplicateCycles(rawCycles);
+
+        return {
+            totalFilesScanned: graph.size,
+            cyclesFound: uniqueCycles.length,
+            cycles: uniqueCycles.map(chain => ({
+                chain,
+                length: chain.length - 1, // 环长度 = 节点数（不含重复的首节点）
+            })),
+        };
+    }
+
+    /**
+     * 对检测到的环进行归一化去重。
+     * 同一个环 a→b→a 和 b→a→b 被视为同一个环。
+     * 归一化方式：去掉末尾重复节点，旋转使最小字典序节点在首位，再加回末尾。
+     */
+    private deduplicateCycles(rawCycles: string[][]): string[][] {
+        const seen = new Set<string>();
+        const result: string[][] = [];
+
+        for (const cycle of rawCycles) {
+            if (cycle.length < 2) continue;
+
+            // cycle 格式: [a, b, c, a] — 去掉末尾得到 [a, b, c]
+            const nodes = cycle.slice(0, -1);
+
+            // 旋转使字典序最小的节点在首位
+            let minIdx = 0;
+            for (let i = 1; i < nodes.length; i++) {
+                if (nodes[i] < nodes[minIdx]) {
+                    minIdx = i;
+                }
+            }
+            const rotated = [...nodes.slice(minIdx), ...nodes.slice(0, minIdx)];
+            const key = rotated.join(' -> ');
+
+            if (!seen.has(key)) {
+                seen.add(key);
+                // 恢复为完整环格式（末尾加回首节点）
+                result.push([...rotated, rotated[0]]);
+            }
+        }
+
+        return result;
     }
 
     /**
@@ -2397,4 +2722,26 @@ export interface RenamePreview {
         }>;
     }>;
     warnings: string[];
+}
+
+export interface CycleCheckResult {
+    totalFilesScanned: number;
+    cyclesFound: number;
+    cycles: Array<{
+        chain: string[];     // 循环链，如 ["a.lua", "b.lua", "c.lua", "a.lua"]
+        length: number;      // 环长度
+    }>;
+}
+
+export type SemanticContext = 'call' | 'definition' | 'comment' | 'string' | 'unknown';
+
+export interface SearchResult {
+    totalMatches: number;
+    results: Array<{
+        file: string;
+        line: number;
+        content: string;
+        context: SemanticContext;
+        confidence: 'medium';
+    }>;
 }

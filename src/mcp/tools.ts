@@ -24,6 +24,8 @@ import {
     handleFileDeps,
     handleRenamePreview,
     handleCheckAliases,
+    handleSearch,
+    handleCheckCycles,
 } from '../daemon/query-handler.js';
 import type { AssetIndex } from '../core/asset-index.js';
 import type { ProtocolIndex } from '../core/protocol-index.js';
@@ -308,6 +310,35 @@ export function registerTools(
         },
         async (args) => wrapTool(lspManager, indexingReady, () =>
             handleCheckAliases(ctx, args),
+        ),
+    );
+
+    // ===== csg_search =====
+    server.tool(
+        'csg_search',
+        '带语义过滤的代码搜索。在 grep 基础上区分匹配出现在调用、定义、注释还是字符串中。支持正则和语言/语义上下文过滤。',
+        {
+            pattern: z.string().describe('搜索模式（支持正则，如 "ItemManager" 或 "get\\w+Data"）'),
+            language: z.enum(['csharp', 'lua', 'all']).optional().default('all').describe('限制语言（默认 all）'),
+            context: z.enum(['call', 'definition', 'comment', 'string', 'all']).optional().default('all').describe('语义过滤：call=调用, definition=定义, comment=注释, string=字符串, all=全部'),
+            limit: z.number().optional().default(100).describe('最大返回条数（默认 100）'),
+        },
+        async (args) => wrapTool(lspManager, indexingReady, () =>
+            handleSearch(ctx, args),
+        ),
+    );
+
+    // ===== csg_check_cycles =====
+    server.tool(
+        'csg_check_cycles',
+        '检测 Lua require 循环依赖。扫描所有 Lua 文件的 require 关系，用 DFS 检测环。返回所有循环链及其长度。',
+        {
+            file: z.string().optional().describe('从指定文件出发检测（相对路径），不提供则全局检测'),
+            language: z.enum(['lua', 'csharp', 'all']).optional().default('lua').describe('检测语言（默认 lua，C# using 暂不支持循环检测）'),
+            max_depth: z.number().optional().default(10).describe('最大检测深度（默认 10）'),
+        },
+        async (args) => wrapTool(lspManager, indexingReady, () =>
+            handleCheckCycles(ctx, args),
         ),
     );
 }
