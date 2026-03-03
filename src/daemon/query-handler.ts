@@ -501,6 +501,17 @@ const UNITY_NOISE_PATTERNS = [
     // CS0019: 运算符无法应用（缺少 Unity 值类型的运算符重载）
     /运算符.+无法应用于/,
     /operator .+ cannot be applied to operands of type/i,
+    // CS0518: 预定义类型未定义（System.Object/Void/Int32 等，netstandard DLL 解析失败）
+    /预定义类型.+未定义或导入/,
+    /predefined type .+ is not defined or imported/i,
+    // CS0117: 类型不包含定义（缺少程序集导致成员解析失败）
+    /不包含.+的定义/,
+    /does not contain a definition for/i,
+    // CS1061: 不包含定义且无可访问的扩展方法
+    /未包含.+的定义/,
+    // CS0012: 类型在未引用的程序集中定义
+    /在未被引用的程序集中定义/,
+    /is defined in an assembly that is not referenced/i,
 ];
 
 function isUnityNoiseError(message: string): boolean {

@@ -1,6 +1,6 @@
 {
   "name": "codesymbolgraph",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Code symbol graph for cross-language LSP querying via MCP",
   "type": "module",
   "main": "dist/cli/index.js",
