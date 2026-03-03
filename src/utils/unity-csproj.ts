@@ -57,6 +57,48 @@ function extractReferences(content: string): DllReference[] {
     return refs;
 }
 
+/**
+ * 从已收集的 DLL 引用中推断 Unity 引擎 DLL 目录，补充隐式引用的核心模块。
+ * Unity asmdef 系统会隐式引用所有 UnityEngine/UnityEditor 核心模块，
+ * 但生成的 .csproj 不会显式列出这些引用。Roslyn 需要它们才能正确解析继承链。
+ */
+function supplementUnityImplicitReferences(
+    references: Map<string, string>,
+    projectRoot: string,
+): void {
+    const unityDllDirs = new Set<string>();
+    for (const [name, hintPath] of references) {
+        if (name.startsWith('UnityEngine.') || name === 'UnityEngine' ||
+            name.startsWith('UnityEditor.') || name === 'UnityEditor') {
+            const absPath = path.isAbsolute(hintPath) ? hintPath : path.join(projectRoot, hintPath);
+            const dir = path.dirname(absPath);
+            if (fs.existsSync(dir)) {
+                unityDllDirs.add(dir);
+            }
+        }
+    }
+
+    if (unityDllDirs.size === 0) return;
+
+    for (const dir of unityDllDirs) {
+        let files: string[];
+        try {
+            files = fs.readdirSync(dir);
+        } catch {
+            continue;
+        }
+        for (const file of files) {
+            if (!file.endsWith('.dll')) continue;
+            if (!file.startsWith('UnityEngine.') && !file.startsWith('UnityEditor.')) continue;
+            const dllName = file.replace('.dll', '');
+            if (!references.has(dllName)) {
+                const fullPath = path.join(dir, file);
+                references.set(dllName, fullPath);
+            }
+        }
+    }
+}
+
 function generateGuid(name: string): string {
     const hash = crypto.createHash('md5').update(name).digest('hex');
     return `{${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}}`;
@@ -115,6 +157,9 @@ export function convertUnityProject(projectRoot: string): ConvertResult {
     if (allCompileItems.size === 0) {
         throw new Error('未找到任何可转换的 Unity .csproj 或 Compile 项');
     }
+
+    // 补充 Unity 隐式引用的核心模块（asmdef 不显式列出 CoreModule 等）
+    supplementUnityImplicitReferences(allReferences, projectRoot);
 
     // 过滤掉文件不存在的 DLL 引用
     const validReferences: Array<[string, string]> = [];

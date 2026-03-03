@@ -1,6 +1,6 @@
 {
   "name": "codesymbolgraph",
-  "version": "0.1.0",
+  "version": "1.0.1",
   "description": "Code symbol graph for cross-language LSP querying via MCP",
   "type": "module",
   "main": "dist/cli/index.js",
@@ -13,7 +13,10 @@
     "start": "node dist/cli/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
-    "verify-lsp": "tsx scripts/verify-lsp.ts"
+    "verify-lsp": "tsx scripts/verify-lsp.ts",
+    "release:patch": "npm version patch && npm run build",
+    "release:minor": "npm version minor && npm run build",
+    "release:major": "npm version major && npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

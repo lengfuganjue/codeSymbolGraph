@@ -19,6 +19,10 @@ import { setTimeouts } from '../utils/timeout.js';
 import { isUnityOldFormat, isUnityProject, convertUnityProject } from '../utils/unity-csproj.js';
 import { AssetIndex } from '../core/asset-index.js';
 import { ProtocolIndex } from '../core/protocol-index.js';
+import { createRequire } from 'module';
+
+const __require = createRequire(import.meta.url);
+const { version: PKG_VERSION } = __require('../../package.json');
 
 const CONFIG_DIR = '.codesymbolgraph';
 const CONFIG_FILE = 'config.json';
@@ -157,7 +161,7 @@ const program = new Command();
 program
     .name('csg')
     .description('CodeSymbolGraph - LSP-based semantic query layer for AI code assistants')
-    .version('0.1.0');
+    .version(PKG_VERSION);
 
 // ===== csg init =====
 program
@@ -219,8 +223,12 @@ program
             for (const dir of luaDirs) {
                 try {
                     await fs.access(path.join(process.cwd(), dir));
-                    luaRoot = dir;
-                    break;
+                    // Verify directory actually contains .lua files
+                    const probe = await glob(`${dir}/**/*.lua`, { cwd: process.cwd() });
+                    if (probe.length > 0) {
+                        luaRoot = dir;
+                        break;
+                    }
                 } catch { /* not exist, continue */ }
             }
         }
@@ -363,7 +371,7 @@ program
             process.exit(1);
         }
 
-        console.log('Starting CodeSymbolGraph daemon...\n');
+        console.log(`Starting CodeSymbolGraph v${PKG_VERSION} daemon...\n`);
 
         // 防止未捕获异常导致 daemon 崩溃
         process.on('uncaughtException', (err) => {
@@ -538,13 +546,13 @@ program
         // 检查是否有 daemon 在运行
         const daemon = await readDaemonInfo();
         if (daemon && isDaemonAlive(daemon)) {
-            console.error(`[CSG] Daemon detected (pid=${daemon.pid}, port=${daemon.port}), using proxy mode`);
+            console.error(`[CSG] v${PKG_VERSION} — Daemon detected (pid=${daemon.pid}, port=${daemon.port}), using proxy mode`);
             const { startMcpProxyServer } = await import('../mcp/server.js');
             await startMcpProxyServer(daemon.port);
             return;
         }
 
-        console.error('[CSG] No daemon detected, starting in standalone mode');
+        console.error(`[CSG] v${PKG_VERSION} — No daemon detected, starting in standalone mode`);
 
         // 初始化资源索引和协议索引
         const assetIndex = new AssetIndex();
